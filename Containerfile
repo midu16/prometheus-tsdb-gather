@@ -38,6 +38,20 @@
 # =============================================================================
 FROM registry.redhat.io/openshift4/ose-must-gather:latest
 
+# Apply available UBI-8 security/bug fixes (expat, libxml2, tar, coreutils,
+# gawk, gdbserver, libgcc/libstdc++, bind, ...). The UBI-8 public repos carry
+# these as regular updates, not 'security', so use a plain update.
+# Also drop the subscription-manager stack: the payload never registers or
+# consumes entitlements in-cluster, and the subman packages carry many
+# unfixable CVEs (python3-syspurpose, rhsm-certificates, cloud-what, ...).
+# 'oc', dnf, tar and rsync all keep working after the removal (verified).
+RUN dnf -y update \
+    && dnf -y remove subscription-manager dnf-plugin-subscription-manager \
+           python3-syspurpose python3-cloud-what \
+           subscription-manager-rhsm-certificates \
+           python3-subscription-manager-rhsm \
+    && rm -rf /var/cache/dnf /var/cache/yum
+
 # Custom entrypoint: pre-flight -> TSDB snapshot (Prometheus Admin API,
 # with crash-consistent direct-copy fallback) -> oc cp extraction ->
 # remote cleanup. Stock gather_* helpers remain in the image if future
