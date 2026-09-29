@@ -8,6 +8,23 @@ Two-stage toolkit:
 2. **Play back** — a Podman/Docker compose stack opens the snapshot in local
    Prometheus + Grafana, with zero scraping and no manual datasource setup.
 
+
+---
+
+## DEMO
+
+End-to-end recording of a real run on this SNO cluster: the
+`oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:v6` call,
+the in-cluster gather (pre-flight → snapshot probe → `MODE=direct` copy of
+the ~1 GB TSDB), the local data-integrity checks, and the compose playback
+querying the extracted historical data.
+
+<p align="center">
+  <img src="demo/gather-demo.gif" alt="must-gather TSDB extraction demo" width="100%">
+</p>
+
+> Full-size source: [`demo/gather-demo.gif`](demo/gather-demo.gif) (~3.1 MB, 1240 px, 109 frames).
+
 ---
 
 ## PART 1 — Extract
