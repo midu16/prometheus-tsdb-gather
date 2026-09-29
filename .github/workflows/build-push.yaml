@@ -43,7 +43,7 @@ jobs:
         if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: quay.io
           username: ${{ secrets.USERNAME }}
           password: ${{ secrets.PASSWORD }}
 
