@@ -39,14 +39,6 @@ jobs:
             echo "tags=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Log in to Quay
-        if: github.event_name == 'push'
-        uses: docker/login-action@v3
-        with:
-          registry: quay.io
-          username: ${{ secrets.USERNAME }}
-          password: ${{ secrets.PASSWORD }}
-
       - name: Build and push
         if: github.event_name == 'push'
         uses: docker/build-push-action@v6
