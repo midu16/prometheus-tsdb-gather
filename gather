@@ -1,0 +1,424 @@
+#!/usr/bin/bash
+# =============================================================================
+# gather  --  must-gather payload entrypoint for Prometheus TSDB extraction
+#
+# Must-gather contract (see openshift/must-gather must-gather.md DESIGN section):
+#   1. Zero-arg executable at /usr/bin/gather
+#   2. Writes everything meant to be shipped back into /must-gather
+#      (the MUST_GATHER env var holds this path; we default to /must-gather so
+#      the script can also run outside the framework for debugging)
+#   3. Writes /must-gather/version (line 1: product, line 2: version)
+#   4. Must NOT leak sensitive data (tokens, certs) into /must-gather
+#
+# AUTH MODEL
+#   The operator's local kubeconfig (cluster-admin) is delivered by
+#   run-must-gather.sh, which creates a Secret and makes the framework's
+#   container command bootstrap it into the pod at
+#       /etc/must-gather-kubeconfig/kubeconfig
+#   BEFORE /usr/bin/gather runs (see that script for the exact mechanism).
+#   This script exports KUBECONFIG for EVERY oc call below.
+#   Fallback: if the file is absent (plain 'oc adm must-gather --image
+#   <custom>' without the wrapper), the framework's in-cluster
+#   cluster-admin SA token is used (verified working: the pod gets the
+#   must-gather-*-clusterrolebinding) - so the payload works both ways.
+#   The injected kubeconfig itself is NEVER copied into /must-gather (rule 4).
+#
+# Flow: auth bootstrap -> pre-flight -> extraction:
+#   MODE=snapshot  (preferred, when the admin API is enabled):
+#       POST /api/v1/admin/tsdb/snapshot -> oc cp snapshots/<ts> out -> rm remote
+#   MODE=direct    (fallback, the VERIFIED reality of this cluster:
+#       Prometheus 3.13.2, OCP operator does NOT enable the
+#       prometheus-admin-api feature, Admin API answers 500
+#       "admin APIs disabled"):
+#       oc cp the live TSDB dir /prometheus out as-is. A TSDB on disk
+#       (compacted block dirs + WAL + chunks_head) is crash-consistent by
+#       design: a local prometheus re-opening the copy replays the WAL and
+#       loses at most the torn tail of the newest WAL segment. NOTHING is
+#       written to the target pod; there is nothing to clean up.
+#   -> forensic metadata -> remote cleanup (snapshot mode only)
+#
+# KNOWN PAYLOAD-CLIENT QUIRK: the ose-must-gather base ships an oc 4.15 client;
+#   'oc whoami' there takes NO --timeout flag (verified: fails with
+#   'unknown flag'). All oc calls below are therefore written to be
+#   4.15-compatible.
+# =============================================================================
+set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Configuration / environment
+# ---------------------------------------------------------------------------
+SNO_NODE="master-0"                       # the single node of this SNO install
+MON_NS="openshift-monitoring"             # namespace hosting Prometheus on OCP
+PROM_POD="${PROM_POD:-prometheus-k8s-0}"  # can be overridden; default = the
+                                           # well-known name of the k8s prometheus
+PROM_CONTAINER="prometheus"               # container name inside the prom pod
+PROM_DATA_DIR="/prometheus"               # prometheus -storage.tsdb.path on-disk
+PROM_SNAP_DIR="${PROM_DATA_DIR}/snapshots"   # Admin API writes <dir>/snapshots/<ts>
+ADMIN_TIMEOUT=10                          # seconds per curl to the Admin API
+OUT_DIR="${MUST_GATHER:-/must-gather}"    # the rsync-able output dir
+TSDB_OUT_DIR="${OUT_DIR}/prometheus-snapshot"
+METADATA_DIR="${OUT_DIR}/prometheus-metadata"
+SNAPSHOT_NAME=""                          # set once snapshot succeeds (used by trap)
+
+# The injected kubeconfig (see AUTH MODEL in the header). Path is the
+# framework-standard volume mount added by run-must-gather.sh; the env var
+# lets a developer point at a file when running this script in-cluster by hand
+# (e.g. via 'oc debug' into the gather pod).
+KUBECONFIG_MOUNT_PATH="/etc/must-gather-kubeconfig/kubeconfig"
+KUBECONFIG_FILE="${MUST_GATHER_KUBECONFIG:-${KUBECONFIG_MOUNT_PATH}}"
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+log()  { echo "[gather $(date -u +%H:%M:%S)] $*" | tee -a "${OUT_DIR}/gather.log"; }
+fail() { log "FATAL: $*"; exit 1; }
+warn() { log "WARN: $*"; }
+
+MODE="snapshot"                      # snapshot | direct (decided in PART 1)
+PROM_PORT=""                         # resolved in 0d (9091 or 9090)
+
+# Best-effort cleanup so we NEVER leave a stale admin-API snapshot behind on
+# the target prometheus pod, even if the gather pod is force-deleted or the
+# script aborts. Removing a snapshot is safe: it is a pure copy of the
+# crash-consistent TSDB (documented behavior; the live TSDB is not touched).
+# Direct mode (fallback) performs NO writes to the pod at all - there is
+# nothing to clean up in that case.
+cleanup_remote() {
+    if [[ "${MODE}" == "snapshot" && -n "${SNAPSHOT_NAME}" ]]; then
+        log "Cleanup: removing snapshot '${SNAPSHOT_NAME}' on ${PROM_POD}"
+        oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+            rm -rf "${PROM_SNAP_DIR}/${SNAPSHOT_NAME}" 2>/dev/null || \
+            warn "could not remove remote snapshot (pod gone?)"
+    fi
+}
+trap cleanup_remote EXIT
+
+mkdir -p "${OUT_DIR}" "${TSDB_OUT_DIR}" "${METADATA_DIR}"
+
+# ---------------------------------------------------------------------------
+# /must-gather/version  (framework convention: 2-line version file)
+# ---------------------------------------------------------------------------
+{
+    echo "prometheus-tsdb-must-gather"
+    echo "1.1.0"
+} > "${OUT_DIR}/version"
+
+# ---------------------------------------------------------------------------
+# PART -1 - AUTHENTICATION: bind every oc/curl call to the operator's kubeconfig
+#
+# run-must-gather.sh appends a Secret volume to the gather init container:
+#   volumes:     [{name: kubeconfig, secret: {secretName: <ns>/mg-kubeconfig}}]
+#   volumeMounts:[{name: kubeconfig, mountPath: /etc/must-gather-kubeconfig}]
+# KUBECONFIG is exported HERE - all later 'oc' invocations in this script
+# (and any it spawns) inherit it. The file is a standard kubeconfig with a
+# cluster-admin user; it authenticates directly to the API server, which the
+# Prometheus API hop (0d) relies on for 'oc exec ... curl'.
+# ---------------------------------------------------------------------------
+log "Auth: resolving kubeconfig for all oc/curl calls"
+if [[ -f "${KUBECONFIG_FILE}" ]]; then
+    # Validate it is a parseable kubeconfig before trusting it to auth.
+    oc version --client > /dev/null 2>&1 || true
+    grep -q "apiVersion:" "${KUBECONFIG_FILE}" \
+        || fail "injected kubeconfig at ${KUBECONFIG_FILE} is not a kubeconfig file"
+    # Export for THIS process and all children (oc, curl wrappers, etc.)
+    export KUBECONFIG="${KUBECONFIG_FILE}"
+    # Record WHICH identity we are running as WITHOUT leaking credentials:
+    # 'oc whoami' prints the username only - never the token.
+    # NOTE: NO --timeout flag: the payload's oc 4.15 client rejects it
+    # (verified: 'error: unknown flag: --timeout').
+    log "Auth: KUBECONFIG exported: ${KUBECONFIG_FILE} (user: $(oc whoami 2>&1 || echo 'whoami failed'))"
+else
+    # No injected secret -> fall back to the framework-default in-cluster
+    # ServiceAccount credential (the must-gather pod runs with a
+    # cluster-admin-bound SA - see framework clusterrolebinding). Unset
+    # rather than point at a file so 'oc' uses the pod's own token.
+    unset KUBECONFIG
+    log "Auth: no kubeconfig at ${KUBECONFIG_FILE} - using in-cluster SA credential (user: $(oc whoami 2>&1 || echo 'whoami failed'))"
+fi
+
+# ---------------------------------------------------------------------------
+# PART 0 - PRE-FLIGHT CHECKS
+# ---------------------------------------------------------------------------
+
+# 0a. kube API must be reachable with the credentials from PART -1 above.
+#     ('oc whoami' WITHOUT --timeout: unknown flag on the payload's oc 4.15.)
+log "Pre-flight: verifying API server access"
+oc whoami > "${OUT_DIR}/whoami.txt" 2>&1 \
+    || fail "oc whoami failed - gather pod has no cluster access (see whoami.txt)"
+
+# 0b. SNO node readiness. On a healthy 1-node SNO, master-0 must be Ready and
+#     carry ALL roles (control-plane, master, worker).
+log "Pre-flight: checking node '${SNO_NODE}' readiness"
+NODE_JSON=$(oc get node "${SNO_NODE}" -o json 2>&1) \
+    || fail "node '${SNO_NODE}' not found: ${NODE_JSON}"
+{
+    echo "$NODE_JSON"
+} > "${METADATA_DIR}/node-${SNO_NODE}.json"
+NODE_PHASE=$(echo "$NODE_JSON" | jq -r '[.status.conditions[]? | select(.type=="Ready")][0].status // "Unknown"')
+[[ "${NODE_PHASE}" == "True" ]] \
+    || fail "node '${SNO_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown})"
+echo "$NODE_JSON" | jq -c '.metadata.labels // {}' > "${METADATA_DIR}/node-${SNO_NODE}-labels.json"
+grep -q 'node-role.kubernetes.io/control-plane' "${METADATA_DIR}/node-${SNO_NODE}-labels.json" \
+    || warn "node missing control-plane role label (expected on SNO)"
+
+# 0c. prometheus-k8s-0 must exist and be Running+Ready. The field-selector
+#     narrows the watch server-side; we grep the exact pod name because some
+#     upgrades briefly rename/migrate the statefulset ordinal.
+log "Pre-flight: locating prometheus pod '${PROM_POD}' in ${MON_NS}"
+PROM_POD=$(oc get pods -n "${MON_NS}" \
+        -l prometheus=k8s --field-selector=status.phase==Running \
+        --no-headers -o custom-columns=":metadata.name" 2>/dev/null \
+    | grep -x "${PROM_POD}" || true)
+[[ -n "${PROM_POD}" ]] \
+    || fail "pod '${PROM_POD}' not Running in ${MON_NS} (prometheus broken?)"
+# NOTE 1: the Ready condition status is the STRING "True" (capital) — grep
+#        must be case-insensitive (a plain 'grep -q true' misses it and
+#        falsely fails: observed 2026-09-29, pod 6/6 Ready -> FATAL).
+# NOTE 2: the pod may be mid-restart (6 restarts in 16h was observed); bound
+#        a 180s retry so a transient NotReady at probe time is not fatal.
+READY_OK=0
+for i in $(seq 1 18); do
+    ST=$(oc get pod -n "${MON_NS}" "${PROM_POD}" -o json 2>/dev/null | \
+         jq -r '.status.conditions[] | select(.type=="Ready") | .status' 2>/dev/null | head -1)
+    [[ "${ST}" == "True" ]] && { READY_OK=1; break; }
+    [[ ${i} -lt 18 ]] && log "Pod ${PROM_POD} Ready=${ST:-?} - waiting (attempt ${i}/18)"
+    sleep 10
+done
+[[ ${READY_OK} -eq 1 ]] \
+    || fail "pod '${PROM_POD}' is Running but not Ready after 180s (last: Ready=${ST:-unknown})"
+oc get pod -n "${MON_NS}" "${PROM_POD}" -o json > "${METADATA_DIR}/${PROM_POD}.json"
+
+# 0d. Prometheus HTTP API reachability + web-port detection. OCP managed
+#     prometheus listens on 127.0.0.1:9090 behind a kube-rbac-proxy on :9091;
+#     'oc exec ... curl 127.0.0.1:<port>' bypasses the proxy entirely and
+#     talks to the real process (which is why the admin POST works without a
+#     token). We probe both ports and remember the winner in PROM_PORT.
+#     NOTE: this proves the HTTP API is up - it does NOT prove the ADMIN mux
+#     is enabled (Prom 3.x feature-gates it; checked live in PART 1).
+log "Pre-flight: checking Prometheus HTTP API (port probe 9090/9091)"
+for p in 9090 9091; do
+    SNAPLIST=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        curl -fsS -m "${ADMIN_TIMEOUT}" "http://127.0.0.1:${p}/api/v1/status/runtimeinfo" 2>/dev/null || true)
+    [[ -n "${SNAPLIST}" ]] && { PROM_PORT="${p}"; break; }
+done
+[[ -n "${SNAPLIST}" ]] \
+    || fail "Prometheus HTTP API unreachable on ${PROM_POD} (tried 127.0.0.1:9090 and :9091 from inside the pod)"
+echo "${SNAPLIST}" > "${METADATA_DIR}/prometheus-runtimeinfo.json"
+PROM_VER=$(echo "${SNAPLIST}" | jq -r '.data.version // empty' 2>/dev/null)
+log "Prometheus HTTP API on 127.0.0.1:${PROM_PORT} inside ${PROM_POD}; version: ${PROM_VER:-unknown}"
+
+# 0d2. TSDB data dir sanity: record what we will copy in direct mode, and its
+#      size (budget check for the must-gather ephemeral volume; the framework
+#      enforces --volume-percentage on exactly this copy).
+log "Pre-flight: inventorying ${PROM_DATA_DIR} on ${PROM_POD}"
+oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+    sh -c 'echo "=== blocks"; ls -1d '"${PROM_DATA_DIR}"'/*/ 2>/dev/null; \
+           echo "=== wal"; ls -la '"${PROM_DATA_DIR}"'/wal 2>/dev/null | head; \
+           echo "=== snapshots (pre-existing)"; ls -1 '"${PROM_DATA_DIR}"'/snapshots 2>/dev/null; true' \
+    > "${METADATA_DIR}/prometheus-tsdb-inventory.txt" 2>&1 || true
+# numeric KiB so it parses cleanly; humanize for the log line
+TSDB_KIB=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+    du -sk "${PROM_DATA_DIR}" 2>/dev/null | awk '{print $1}')
+TSDB_MIB=$(( ${TSDB_KIB:-0} / 1024 ))
+log "Live TSDB size: ${TSDB_MIB} MiB (direct-mode oc cp budget; the framework caps the pod volume at --volume-percentage)"
+
+# 0e. Disk sanity: snapshots are written ON the pod's local disk (SNO = the
+#     PV backing /prometheus), so a nearly-full target will make the snapshot
+#     API fail with 'no space left'.
+log "Pre-flight: checking free space in ${PROM_DATA_DIR} on ${PROM_POD}"
+oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- df -h "${PROM_DATA_DIR}" \
+    | tee "${METADATA_DIR}/prometheus-df.txt" >/dev/null \
+    || warn "df check failed (continuing)"
+
+# ---------------------------------------------------------------------------
+# PART 1 - EXECUTION: obtain a crash-consistent TSDB copy
+#
+# PREFERRED (MODE=snapshot):
+#   'POST /api/v1/admin/tsdb/snapshot' makes prometheus copy ALL blocks + the
+#   full WAL into ${PROM_DATA_DIR}/snapshots/<UTC-timestamp> atomically with
+#   respect to its own writes - the textbook safe export.
+#
+#   CAVEAT (verified on THIS cluster, 2026-09-29): Prometheus >= 3.x
+#   feature-gates the admin HTTP API behind
+#     --enable-feature=prometheus-admin-api
+#   and the OCP prometheus-operator does NOT set it by default. The probe
+#   below therefore expects (and handles) 500 {"error":"admin APIs disabled"}.
+#
+# FALLBACK (MODE=direct):
+#   A TSDB on disk is CRASH-CONSISTENT by design: compacted block dirs are
+#   self-contained, and the WAL + chunks_head are replayed by whoever re-opens
+#   the data dir. Copying /prometheus while prometheus runs therefore yields a
+#   TSDB that a standalone prometheus can open; the only possible loss is the
+#   torn tail of the NEWEST WAL segment (partial write in flight during the
+#   copy window) - standard forensic behavior, recorded in the metadata.
+#   No write to the live pod, no remote cleanup needed.
+#
+# Enabling the real admin API on this cluster (future runs, optional):
+#   oc patch prometheus k8s -n openshift-monitoring --type=merge \
+#     -p '{"spec":{"enableFeatures":["delayed-compaction","use-uncached-io","prometheus-admin-api"]}}'
+#   (pod restarts once; PART 1 will then take the snapshot path automatically)
+# ---------------------------------------------------------------------------
+log "Probing Prometheus Admin API on 127.0.0.1:${PROM_PORT} (POST admin/tsdb/snapshot)"
+SNAP_RESP=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+    curl -sS -m 300 -X POST "http://127.0.0.1:${PROM_PORT}/api/v1/admin/tsdb/snapshot" 2>&1)
+SNAP_RC=$?
+echo "${SNAP_RESP}" > "${METADATA_DIR}/snapshot-probe-response.txt"
+
+if [[ ${SNAP_RC} -eq 0 && "$(echo "${SNAP_RESP}" | jq -r '.status // empty' 2>/dev/null)" == "success" ]]; then
+    MODE="snapshot"
+    SNAPSHOT_NAME=$(echo "${SNAP_RESP}" | jq -r '.data.name // empty')
+    [[ -n "${SNAPSHOT_NAME}" && "${SNAPSHOT_NAME}" != "null" ]] \
+        || fail "snapshot response had no data.name: ${SNAP_RESP}"
+    log "Admin API snapshot created: ${SNAPSHOT_NAME}"
+else
+    MODE="direct"
+    log "Admin API snapshot unavailable (rc=${SNAP_RC}; ${SNAP_RESP:0:120})"
+    log "Falling back to MODE=direct: copy the crash-consistent TSDB at ${PROM_DATA_DIR} as-is"
+fi
+
+# ---------------------------------------------------------------------------
+# PART 2 - EXTRACTION into the must-gather output dir
+#
+# 'oc cp src:dst' streams a tar over the exec channel - the canonical way to
+# pull a directory from a pod.
+#
+#   MODE=snapshot:  remote <PROM_DATA_DIR>/snapshots/<TS>
+#                   local  ${TSDB_OUT_DIR}/<TS>/{blocks..., wal/...}
+#   MODE=direct:    remote <PROM_DATA_DIR>           (blocks, wal, chunks_head,
+#                   local  ${TSDB_OUT_DIR}/<TS>/{blocks..., wal/...}
+#                   the local dir is named with a UTC timestamp so the layout
+#                   is identical for both modes and the playbook (compose
+#                   SNAPSHOT_DIR) never has to know which mode ran.)
+#
+# queries.active / lock are ephemeral open-state files - excluded in direct
+# mode; the local prometheus recreates them on startup.
+# ---------------------------------------------------------------------------
+DIRECT_TARGET="${TSDB_OUT_DIR}/$(date -u +%Y%m%dT%H%M%SZ)"
+RCP_SRC="${PROM_POD}:${PROM_DATA_DIR}"
+if [[ "${MODE}" == "snapshot" ]]; then
+    RCP_SRC="${PROM_POD}:${PROM_SNAP_DIR}/${SNAPSHOT_NAME}"
+fi
+
+log "Extracting ${RCP_SRC} -> ${DIRECT_TARGET} (mode=${MODE})"
+oc cp -n "${MON_NS}" "${RCP_SRC}" "${DIRECT_TARGET}" \
+    --container "${PROM_CONTAINER}" \
+    2> "${OUT_DIR}/oc-cp.stderr"
+RCP_RC=$?   # script runs WITHOUT errexit (set -uo pipefail) so plain capture works
+if [[ ${RCP_RC} -ne 0 ]]; then
+    # retry once - mid-transfer drops are the common cause; the snapshot
+    # (if any) is still on the pod for the retry
+    log "oc cp failed (rc=${RCP_RC}); retrying once"
+    oc cp -n "${MON_NS}" "${RCP_SRC}" "${DIRECT_TARGET}" \
+        --container "${PROM_CONTAINER}" \
+        2> "${OUT_DIR}/oc-cp.stderr.retry" \
+        || fail "oc cp of TSDB failed twice (see ${OUT_DIR}/oc-cp.stderr*)"
+fi
+# direct mode: drop open-state artifacts that must not be replayed
+if [[ "${MODE}" == "direct" ]]; then
+    rm -f "${DIRECT_TARGET}/queries.active" "${DIRECT_TARGET}/lock" 2>/dev/null || true
+    log "Removed ephemeral open-state files (queries.active, lock) from the copy"
+fi
+cp "${OUT_DIR}/oc-cp.stderr" "${METADATA_DIR}/oc-cp.stderr" 2>/dev/null || true
+log "Extraction complete: $(du -sh "${DIRECT_TARGET}" 2>/dev/null | cut -f1) total"
+
+# ---------------------------------------------------------------------------
+# PART 3 - FORENSIC METADATA (small context files that make the copied TSDB
+#         usable offline without re-querying a cluster that may be gone)
+# ---------------------------------------------------------------------------
+log "Gathering forensic metadata (mode=${MODE})"
+REMOTE_VERIFY_PATH="${PROM_SNAP_DIR}/${SNAPSHOT_NAME}"
+[[ "${MODE}" == "direct" ]] && REMOTE_VERIFY_PATH="${PROM_DATA_DIR}"
+oc adm describe pod -n "${MON_NS}" "${PROM_POD}" \
+    > "${METADATA_DIR}/pod-describe.txt" 2>&1 || true
+oc logs -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" --tail=2000 \
+    > "${METADATA_DIR}/prometheus-logs-tail.log" 2>&1 || true
+# in-cluster block inventory (remote view, pre-copy)
+oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+    promtool tsdb list "${REMOTE_VERIFY_PATH}" \
+    > "${METADATA_DIR}/tsdb-remote-blocks.txt" 2>&1 || true
+# Prometheus config (promtool config dump) - reveals retention, remote writes,
+# and scrape configs; safe to include (no secrets in the rendered config).
+# (Path probed from the live pod: config_out/prometheus.env.yaml.)
+oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+    sh -c 'promtool config dump /etc/prometheus/config_out/prometheus.env.yaml \
+        || promtool config dump /etc/prometheus/configout/config_out.yaml' \
+    > "${METADATA_DIR}/prometheus-config.yaml" 2>&1 || true
+oc get -n "${MON_NS}" prometheus k8s -o yaml \
+    | sed -e 's/\(token: \).*/\1<redacted>/' -e 's/\(bearerToken: \).*/\1<redacted>/' \
+    > "${METADATA_DIR}/prometheus-crd.yaml" 2>&1 || true
+oc get -n "${MON_NS}" pod "${PROM_POD}" -o jsonpath='{range .spec.containers[?(@.name=="prometheus")].args[*]}{.}{"\n"}{end}' \
+    > "${METADATA_DIR}/prometheus-args.txt" 2>&1 || true
+# which extraction path ran + why - the playbook reads this
+{
+    echo "mode=${MODE}"
+    echo "prom_port=${PROM_PORT}"
+    echo "snapshot_name=${SNAPSHOT_NAME:-(none)}"
+    echo "local_target=${DIRECT_TARGET}"
+    [[ "${MODE}" == "direct" ]] \
+        && echo "note=direct copy of live TSDB; local prometheus replays WAL on startup; worst-case loss = torn tail of the newest WAL segment"
+} > "${METADATA_DIR}/extraction-mode.json"
+
+# INTEGRITY CHECK (in-cluster, using the prom pod's exact promtool).
+# promtool 3.x has NO 'tsdb verify' subcommand (removed); the real, read-only
+# checks are:
+#   - 'tsdb list'    : reads every block's meta.json (ULID + time bounds)
+#   - 'tsdb analyze' : loads postings + a chunk page for a block (real read)
+# Both are safe on the LIVE dir (read-only). We analyze the newest compacted
+# block only (full analyze of a multi-GB TSDB is slow; one block proves the
+# index+chunk read path end to end).
+log "Verifying TSDB integrity in-cluster (promtool tsdb list + analyze on ${PROM_POD})"
+oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+    promtool tsdb list "${REMOTE_VERIFY_PATH}" \
+    > "${METADATA_DIR}/tsdb-verify.txt" 2>&1
+# newest compacted block = highest ULID that is a real block dir (not wal/chunks_head/snapshots)
+NEWEST_BLOCK=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+    sh -c 'ls -1 '"${PROM_DATA_DIR}"' 2>/dev/null | grep -E "^[0-9A-Z]{26}$" | sort | tail -1')
+if [[ -n "${NEWEST_BLOCK}" ]]; then
+    log "Analyzing newest block ${NEWEST_BLOCK} (postings+chunk read probe)"
+    # --sandbox-dir-root=/tmp keeps promtool's temp block sandbox OUT of the
+    # live ${PROM_DATA_DIR} (the default writes tmp_dbro_sandbox* next to the
+    # TSDB, which would otherwise be copied into the export).
+    oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        promtool tsdb analyze --sandbox-dir-root=/tmp "${PROM_DATA_DIR}" "${NEWEST_BLOCK}" \
+        > "${METADATA_DIR}/tsdb-analyze-newest.txt" 2>&1 \
+        || warn "promtool tsdb analyze on ${NEWEST_BLOCK} reported issues (see tsdb-analyze-newest.txt)"
+else
+    warn "no compacted block dir found in ${PROM_DATA_DIR} (only WAL? data may be all in head)"
+fi
+# LOCAL structural check of the copy (payload ships NO promtool - it is a slim
+# RHEL base; do not assume promtool here). The authoritative 'does it open'
+# test is the playback Prometheus, so here we verify the copy LOOKS complete:
+log "Structural check of local copy ${DIRECT_TARGET}"
+LOCAL_BLOCKS=$(ls -1 "${DIRECT_TARGET}" 2>/dev/null | grep -cE '^[0-9A-Z]{26}$' || true)
+LOCAL_WAL=$( [[ -d "${DIRECT_TARGET}/wal" ]] && echo yes || echo no )
+LOCAL_META_OK=0
+for b in ${DIRECT_TARGET}/[0-9A-Z][0-9A-Z][0-9A-Z]*/ ; do
+    [[ -f "${b}meta.json" ]] || { LOCAL_META_OK=1; break; }
+done
+{
+    echo "local_blocks=${LOCAL_BLOCKS:-0}"
+    echo "local_wal_present=${LOCAL_WAL}"
+    echo "local_all_blocks_have_meta.json=${LOCAL_META_OK}"
+} > "${METADATA_DIR}/tsdb-local-struct.txt" 2>&1
+[[ ${LOCAL_META_OK} -eq 0 && ${LOCAL_BLOCKS:-0} -gt 0 ]] \
+    || warn "local copy structural check found a problem (see tsdb-local-struct.txt)"
+
+# ---------------------------------------------------------------------------
+# PART 4 - CLEANUP: remove the temporary admin-API snapshot on the target pod
+#
+# Snapshot mode only: the snapshot occupies pod-local disk (SNO local PV);
+# the extracted copy lives in /must-gather and ships back to the operator.
+# Direct mode performs no writes to the pod - nothing to clean up.
+# (The EXIT trap is the safety net for aborted runs.)
+# ---------------------------------------------------------------------------
+if [[ "${MODE}" == "snapshot" && -n "${SNAPSHOT_NAME}" ]]; then
+    log "Cleaning up remote snapshot '${SNAPSHOT_NAME}'"
+    oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        rm -rf "${PROM_SNAP_DIR}/${SNAPSHOT_NAME}" \
+        && log "Remote snapshot removed" \
+        || warn "remote snapshot removal failed"
+    SNAPSHOT_NAME=""   # clear so the EXIT trap does not double-delete
+fi
+
+sync   # flush to the rsync sidecar before the framework copies /must-gather
+log "DONE - mode=${MODE}; TSDB in ${DIRECT_TARGET}, metadata in ${METADATA_DIR}"
