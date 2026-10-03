@@ -2,12 +2,14 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Proposed |
+| **Status** | Done (shipped, gather v1.3.0 — see Outcomes below) |
 | **Type** | Feature / Enhancement |
 | **Priority** | High |
 | **Affected components** | `gather`, `run-must-gather.sh`, must-gather output contract, playback docs |
 | **Related area** | OpenShift must-gather, Prometheus TSDB forensics |
 | **Created** | 2026-10-02 |
+| **Implemented** | 2026-10-03 |
+| **Operator guide** | [`docs/selective-size-safe-gather.md`](../docs/selective-size-safe-gather.md) |
 | **Labels** | `enhancement`, `must-gather`, `tsdb`, `size-budget`, `cli-flags` |
 
 ---
@@ -311,9 +313,49 @@ Flags on the wrapper are the supported UX; env vars remain for debugging and ima
 
 ### Phase 4 — Compression (data-driven)
 
-- [ ] Publish experiment results.
-- [ ] If ROI met: add `COMPRESS` with checksum + unpack instructions for playback.
-- [ ] If ROI not met: keep `COMPRESS=none` default; document opt-in and host-side tips.
+- [x] Publish experiment results.
+- [x] If ROI met: add `COMPRESS` with checksum + unpack instructions for playback.
+- [x] If ROI not met: keep `COMPRESS=none` default; document opt-in and host-side tips.
+
+---
+
+## Outcomes (measured on this cluster, 2026-10-03)
+
+All four capabilities implemented in gather v1.3.0 and verified end-to-end with
+`oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:v6 --dest-dir …`
+against this SNO cluster (Prometheus 3.13.2, `MODE=direct`).
+
+- **Size safeguard** — pre-flight budget gate before any copy. Default budget 2Gi,
+  `SIZE_POLICY=fail`. Verified: full ~960 MiB export under 2Gi budget → `allow`;
+  same export with `100Mi` budget → `FATAL: projected must-gather TSDB export
+  exceeds size budget` + `decision=deny`, **nothing copied**. Artifacts:
+  `prometheus-metadata/size-budget.txt` (written on allow *and* deny).
+- **Time-window export** — verified `--since 16h` → 2 of 5 blocks, 962→652 MiB;
+  excluded blocks never leave the pod. Empty window (30d–29d, older than the
+  ~1 day of data on disk) → `FATAL: no TSDB blocks intersect the requested time
+  window`, pre-copy. Artifacts: `time-window.json`, `block-inventory.tsv`.
+- **Retention** — Tier A+B shipped: `retention.txt` records effective retention
+  (15d from the Prometheus CR), data bounds, and window-vs-data verdict. The
+  live patch Tier C remains intentionally deferred (break-glass only).
+- **Compression** — `COMPRESS=zstd` default. Measured: 850 MB raw → 238 MB
+  `tar.zstd` (ratio ~0.28, i.e. **~72% reduction**) in ~4 s on the gather pod.
+  `SHA256SUMS` shipped; the exact unpack command is in `compression.txt`.
+  Base payload image does **not** ship zstd, so the Containerfile now does
+  `dnf -y install zstd`.
+- **Operator UX** — the whole feature is drivable from the raw framework command
+  (extra args after `--` become the container command), no wrapper required:
+  `oc adm must-gather … --dest-dir … -- /usr/bin/gather --since 6h --max-size 1Gi`.
+  Auth falls back to the framework's in-cluster cluster-admin SA when no Secret is
+  injected. Full guide: `docs/selective-size-safe-gather.md`.
+- **Bug fixes found during verification** — `--max-gb` post-copy prune loop
+  compared against the wrong variable (would prune all blocks when
+  `MAX_GATHER_BYTES=none`); the remote `tar` pipe treated the *expected*
+  live-WAL `file changed as we read it` loss bound as a fatal error. Both
+  fixed; see the git log.
+
+Residual note (documented, not a defect): `oc adm must-gather` does not
+propagate the payload's non-zero exit code, so operators check `gather.log`
+for `FATAL` (both FATAL messages are stable and machine-grepable per §1.3).
 
 ---
 
