@@ -33,11 +33,15 @@
 #       copy WAL + chunks_head when the window reaches the head.
 #       Default: true when until is within 1h of now, else false.
 #   Blocks whose [minTime,maxTime] INTERSECTS [since,until] are copied; all
-#   other blocks never leave the pod. No intersecting block -> FATAL before
-#   the copy. Retention is detected and compared against the window; a
-#   window older than retention fails with a hint (Tier A+B of the feature
-#   doc; live retention patching is intentionally NOT implemented).
-#   Artifacts: time-window.json, retention.txt.
+#   other blocks never leave the pod. A window that misses every block
+#   (typical when retention already GC'd the requested period) is NOT a
+#   hard failure anymore (v1.4.0): it is clamped to the available data
+#   bounds with a WARN, so the gather always ships the closest snapshot
+#   the cluster can still produce. Retention is detected and compared
+#   against the window (Tier A+B of the feature doc; live retention
+#   patching is intentionally NOT implemented).
+#   Artifacts: time-window.json (window_clamped + original request),
+#   retention.txt.
 #
 # Compression (measured 2026-10-02 on a 1.1GB SNO TSDB, see the feature doc
 #   Outcomes): zstd -6 yields ~74% size reduction in ~0.5s -> the default.
@@ -126,8 +130,11 @@ Size safeguard (pre-flight, before any copy):
                        fail = abort with FATAL before the copy (default)
                        warn = log loudly and continue    (env: SIZE_POLICY)
 Time-window export (selective, block-granular, source-side):
-  --since <ts>         inclusive lower bound (env: SINCE)
-  --until <ts>         inclusive upper bound, default now (env: UNTIL)
+   --since <ts>         inclusive lower bound (env: SINCE)
+   --until <ts>         inclusive upper bound, default now (env: UNTIL)
+                       a window that hits no block is clamped to the
+                       available data (oldest..newest block) with a WARN,
+                       not a failure (v1.4.0)
   --include-wal true|false
                        copy WAL + chunks_head            (env: INCLUDE_WAL;
                        auto: true when until is within 1h of now)
@@ -347,7 +354,7 @@ mkdir -p "${OUT_DIR}" "${TSDB_OUT_DIR}" "${METADATA_DIR}"
 # ---------------------------------------------------------------------------
 {
     echo "prometheus-tsdb-must-gather"
-    echo "1.3.0"
+    echo "1.4.0"
 } > "${OUT_DIR}/version"
 
 # ---------------------------------------------------------------------------
@@ -492,18 +499,26 @@ remote_dir_bytes() {
 # ---------------------------------------------------------------------------
 # TIME-WINDOW SELECTION (feature: selective export).
 #   INVOCATION: select_window "<inventory lines>"
-#   SELECTED_BLOCKS : ULIDs whose [min, max] INTERSECTS [since, until]
+#   SELECTED_BLOCKS : ULIDs whose [min, max] INTERSECTS the window
 #   EXCLUDED_BLOCKS : the rest (never leave the pod)
 #   WAL_INCLUDED    : 1/0 (INCLUDE_WAL resolution: auto -> 1 when the window
 #                     reaches the head, i.e. until >= now - 3600s)
 #   OLDEST_MS / NEWEST_MS : data bounds actually present on the PVC
-# Fails hard (stable message) when nothing intersects the window.
+#   WIN_CLAMPED / WIN_ORIG_SINCE / WIN_ORIG_UNTIL : recorded when the request
+#                     had to be clamped to the available data (v1.4.0)
+# Clamp policy (v1.4.0): a window that would select zero blocks (typical when
+# retention already GC'd the requested period) is NOT a hard failure. The
+# window is clamped to the data bounds on disk with a WARN, so the gather
+# always ships the closest snapshot the cluster can still produce.
 # ---------------------------------------------------------------------------
 SELECTED_BLOCKS=""
 EXCLUDED_BLOCKS=""
 WAL_INCLUDED=0
 OLDEST_MS=0
 NEWEST_MS=0
+WIN_CLAMPED=0
+WIN_ORIG_SINCE=""
+WIN_ORIG_UNTIL=""
 
 select_window() {
     local inv="$1"
@@ -518,34 +533,61 @@ select_window() {
     [[ -n "${inv}" ]] \
         || fail "no compacted TSDB blocks found in ${PROM_DATA_DIR} (only head/WAL?) - cannot select a window"
 
-    local n mt xt kept=0
+    # pass 1: data bounds actually present on the PVC
+    local n mt xt mt_ms xt_ms
     while IFS=$'\t' read -r n mt xt _sz; do
         [[ -n "${n}" ]] || continue
-        local mt_ms=$(( mt * 1000 )) xt_ms=$(( xt * 1000 ))
+        mt_ms=$(( mt * 1000 )); xt_ms=$(( xt * 1000 ))
         if (( mt_ms < OLDEST_MS || OLDEST_MS == 0 )); then OLDEST_MS=${mt_ms}; fi
         if (( xt_ms > NEWEST_MS )); then NEWEST_MS=${xt_ms}; fi
-        if [[ -n "${SINCE_SECONDS}" ]] && (( xt_ms < SINCE_SECONDS * 1000 )); then
-            EXCLUDED_BLOCKS+="${n} "
-            continue
-        fi
-        if [[ "${UNTIL}" != "now" ]] && (( mt_ms > UNTIL_SECONDS * 1000 )); then
+    done <<< "${inv}"
+
+    # pass 2: intersect the requested window with the data bounds on disk to
+    # get the effective window. If the intersection is empty (the request is
+    # fully disjoint from the data - the reported 30d/29d-vs-1day case) fall
+    # back to the FULL data range so the gather still ships the closest
+    # snapshot. Partial overlap just narrows on the side that is in bounds.
+    local d_oldest_s=$(( OLDEST_MS / 1000 )) d_newest_s=$(( NEWEST_MS / 1000 ))
+    local req_since req_until
+    [[ -n "${SINCE_SECONDS}" ]] && req_since=${SINCE_SECONDS} || req_since=${d_oldest_s}
+    [[ "${UNTIL}" != "now" ]]   && req_until=${UNTIL_SECONDS}   || req_until=${d_newest_s}
+    # effective = intersection(requested, data bounds)
+    local eff_since eff_until
+    (( req_since > d_oldest_s )) && eff_since=${req_since} || eff_since=${d_oldest_s}
+    (( req_until < d_newest_s )) && eff_until=${req_until} || eff_until=${d_newest_s}
+    # side-wise advisory: requested a side the data does not reach (retention)
+    [[ -n "${SINCE_SECONDS}" ]] && (( req_since < d_oldest_s )) && \
+        log "WARN: requested --since is older than the oldest block on disk - that older history is missing (retention or fresh TSDB)"
+    [[ -n "${SINCE_SECONDS}" ]] && (( req_since < d_oldest_s )) && \
+        log "  requested since=${SINCE}  oldest_block=$(date -u -d "@${d_oldest_s}" +%Y-%m-%dT%H:%M:%SZ)"
+    [[ "${UNTIL}" != "now" ]] && (( req_until > d_newest_s )) && \
+        log "WARN: requested --until is newer than the newest block on disk - clamping down to the newest data"
+    if (( eff_since > eff_until )); then
+        # fully disjoint from the data: take everything we have (v1.4.0)
+        log "WARN: requested window [${SINCE:-<oldest>} .. ${UNTIL}] does not intersect ANY TSDB block on disk"
+        log "  oldest_block=$(date -u -d "@${d_oldest_s}" +%Y-%m-%dT%H:%M:%SZ)  newest_block=$(date -u -d "@${d_newest_s}" +%Y-%m-%dT%H:%M:%SZ)"
+        log "  exporting the closest available data instead (clamped window); retention_hint=see prometheus-metadata/retention.txt"
+        WIN_CLAMPED=1
+        WIN_ORIG_SINCE=$(date -u -d "@${req_since}" +%Y-%m-%dT%H:%M:%SZ)
+        WIN_ORIG_UNTIL=$(date -u -d "@${req_until}" +%Y-%m-%dT%H:%M:%SZ)
+        eff_since=${d_oldest_s}
+        eff_until=${d_newest_s}
+    fi
+
+    SELECTED_BLOCKS=""
+    EXCLUDED_BLOCKS=""
+    EFF_SINCE_S=${eff_since}
+    EFF_UNTIL_S=${eff_until}
+    while IFS=$'\t' read -r n mt xt _sz; do
+        [[ -n "${n}" ]] || continue
+        mt_ms=$(( mt * 1000 )); xt_ms=$(( xt * 1000 ))
+        if (( mt_ms > eff_until * 1000 )) || (( xt_ms < eff_since * 1000 )); then
             EXCLUDED_BLOCKS+="${n} "
             continue
         fi
         SELECTED_BLOCKS+="${n} "
-        kept=1
     done <<< "${inv}"
-    if [[ ${kept} -eq 0 && ${WINDOW_ACTIVE} -eq 1 ]]; then
-        # windowless (full) runs select everything; only an explicit window
-        # can come back empty, and an empty window is a hard error (contract)
-        log "FATAL: no TSDB blocks intersect the requested time window"
-        log "  since=${SINCE:-<oldest>}  until=${UNTIL}"
-        log "  oldest_block=$(date -u -d "@$(( OLDEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)  newest_block=$(date -u -d "@$(( NEWEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-        log "  retention_hint=see prometheus-metadata/retention.txt"
-        log "  hint: widen the window (--since/--until) or verify cluster retention still holds this period"
-        exit 1
-    fi
-    log "Window: selected $(tr ' ' '\n' <<<"${SELECTED_BLOCKS}" | grep -c .) of $(tr ' ' '\n' <<<"${inv}" | grep -c .) blocks; selected=[${SELECTED_BLOCKS}] excluded=[${EXCLUDED_BLOCKS:-(none)}] wal_included=${WAL_INCLUDED}"
+    log "Window: selected $(tr ' ' '\n' <<<"${SELECTED_BLOCKS}" | grep -c .) of $(tr ' ' '\n' <<<"${inv}" | grep -c .) blocks; selected=[${SELECTED_BLOCKS}] excluded=[${EXCLUDED_BLOCKS:-(none)}] wal_included=${WAL_INCLUDED} clamped=${WIN_CLAMPED:0:1} effective=[$(date -u -d "@${eff_since}" +%Y-%m-%dT%H:%M:%SZ) .. $(date -u -d "@${eff_until}" +%Y-%m-%dT%H:%M:%SZ)]"
 }
 
 # ---------------------------------------------------------------------------
@@ -563,11 +605,11 @@ retention_detect() {
     [[ -n "${cr}" ]] && RETENTION_EFFECTIVE=$(grep -oE '[0-9]+[a-zA-Z]+' <<<"${cr}" | head -1)
     local now_s; now_s=$(date -u +%s)
     local verdict="ok"
-    if [[ -n "${SINCE_SECONDS}" ]]; then
-        # data on disk starts at OLDEST_MS; nothing older can exist
-        if (( OLDEST_MS > SINCE_SECONDS * 1000 )); then
-            verdict="window_older_than_available_data"
-        fi
+    if [[ -n "${SINCE_SECONDS}" ]] && (( SINCE_SECONDS * 1000 > OLDEST_MS )); then
+        verdict="requested_since_newer_than_oldest_block"
+    fi
+    if [[ ${WIN_CLAMPED} -eq 1 ]]; then
+        verdict="request_disjoint_clamped_to_available"
     fi
     {
         echo "retention_effective=${RETENTION_EFFECTIVE}"
@@ -576,16 +618,12 @@ retention_detect() {
         echo "data_newest_block=$(( NEWEST_MS / 1000 ))s  ($(date -u -d "@$(( NEWEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null))"
         echo "requested_since=${SINCE:-<oldest>}"
         echo "requested_until=${UNTIL}"
+        [[ ${WIN_CLAMPED} -eq 1 ]] && echo "requested_since_rfc3339=${WIN_ORIG_SINCE}"
+        [[ ${WIN_CLAMPED} -eq 1 ]] && echo "requested_until_rfc3339=${WIN_ORIG_UNTIL}"
         echo "window_vs_data=${verdict}"
         echo "note=tier A(detect)+B(advise) only: live retention patching (tier C) intentionally not implemented"
+        echo "note=v1.4.0: disjoint windows do NOT fail the run - they are clamped to the available data with a WARN so the gather always ships the closest snapshot"
     } > "${METADATA_DIR}/retention.txt"
-    if [[ "${verdict}" == "window_older_than_available_data" ]]; then
-        log "FATAL: requested window starts before the oldest data on disk"
-        log "  since=${SINCE}  oldest_block=$(date -u -d "@$(( OLDEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
-        log "  retention_hint=see prometheus-metadata/retention.txt (retention=${RETENTION_EFFECTIVE})"
-        log "  hint: widen --since, or (break-glass lab clusters only) raise retention - not implemented by this toolkit"
-        exit 1
-    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -784,8 +822,9 @@ oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- df -h "${PROM_DAT
 
 # 0f. SOURCE-SIDE PLANNING: block inventory -> window selection -> retention
 #     detect -> size-budget gate. All of this runs BEFORE the admin-API
-#     snapshot probe and BEFORE any byte leaves the pod: a budget miss or an
-#     empty window must abort cheaply, with nothing written to the target.
+#     snapshot probe and BEFORE any byte leaves the pod: a budget miss aborts
+#     cheaply, with nothing written to the target. An empty window no longer
+#     aborts (v1.4.0): it is clamped to the available data with a WARN.
 log "Planning: block inventory, window selection, retention, size budget"
 BLOCK_INV=$(remote_block_inventory)
 if [[ -z "${BLOCK_INV}" ]]; then
@@ -1046,25 +1085,31 @@ oc get -n "${MON_NS}" pod "${PROM_POD}" -o jsonpath='{range .spec.containers[?(@
 
 # ---------------------------------------------------------------------------
 # time-window.json (feature contract; written for EVERY run - a windowless
-# run records since=<oldest>/until=now and an empty excluded list)
+# run records since=<oldest>/until=now and an empty excluded list).
+# v1.4.0: 'since'/'until' describe the EFFECTIVE (clamped) window actually
+# exported; 'original_request' records what the operator asked for when the
+# request had to be clamped to the available data.
 # ---------------------------------------------------------------------------
-TW_SINCE=$(date -u -d "@$(( OLDEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ)
-TW_UNTIL=$(date -u -d "@${UNTIL_SECONDS}" +%Y-%m-%dT%H:%M:%SZ)
-[[ -n "${SINCE}" ]] && TW_SINCE=$(date -u -d "@${SINCE_SECONDS}" +%Y-%m-%dT%H:%M:%SZ)
+TW_SINCE=$(date -u -d "@${EFF_SINCE_S}" +%Y-%m-%dT%H:%M:%SZ)
+TW_UNTIL=$(date -u -d "@${EFF_UNTIL_S}" +%Y-%m-%dT%H:%M:%SZ)
 {
     jq -n \
         --arg since "${TW_SINCE}" \
         --arg until "${TW_UNTIL}" \
         --arg wal "${WAL_INCLUDED}" \
-        --arg note "$( [[ "${WINDOW_ACTIVE}" -eq 1 && -n "${EXCLUDED_BLOCKS}" ]] && echo 'Excluded blocks outside window to reduce gather size' || echo 'Full export: no time window requested' )" \
+        --argjson clamped "$([[ ${WIN_CLAMPED} -eq 1 ]] && echo true || echo false)" \
+        --arg orig_since "${WIN_ORIG_SINCE}" \
+        --arg orig_until "${WIN_ORIG_UNTIL}" \
+        --arg note "$( [[ "${WIN_CLAMPED}" -eq 1 ]] && echo 'Requested window did not intersect any TSDB block (retention); clamped to the available data' || { [[ "${WINDOW_ACTIVE}" -eq 1 && -n "${EXCLUDED_BLOCKS}" ]] && echo 'Excluded blocks outside window to reduce gather size' || echo 'Full export: no time window requested'; } )" \
         --argjson included "$( jq -Rn '[inputs | select(length>0)]' <<<"$(tr ' ' '\n' <<<"${SELECTED_BLOCKS}" | grep . || true)" )" \
         --argjson excluded "$( jq -Rn '[inputs | select(length>0)]' <<<"$(tr ' ' '\n' <<<"${EXCLUDED_BLOCKS}" | grep . || true)" )" \
         '{
             since: $since, until: $until,
+            window_clamped: $clamped,
             blocks_included: $included, blocks_excluded: $excluded,
             include_wal: ($wal == "1"),
             notes: $note
-        }'
+        } + (if $clamped then {original_request: {since: $orig_since, until: $orig_until}} else {} end)'
 } > "${METADATA_DIR}/time-window.json"
 
 # INTEGRITY CHECK (in-cluster, using the prom pod's exact promtool).

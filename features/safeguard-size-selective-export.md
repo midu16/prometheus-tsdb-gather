@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| **Status** | Done (shipped, gather v1.3.0 — see Outcomes below) |
+| **Status** | Done (shipped, gather v1.4.0 — see Outcomes below) |
 | **Type** | Feature / Enhancement |
 | **Priority** | High |
 | **Affected components** | `gather`, `run-must-gather.sh`, must-gather output contract, playback docs |
@@ -145,13 +145,18 @@ Relative durations parse like Prometheus (`h`, `d`, `w`). Absolute times are UTC
 
 - Local Prometheus opens a directory of blocks; missing older blocks is fine.
 - Document that queries outside `[since, until]` return empty — Grafana time range must match the window.
-- If **no** block intersects the window → **fail** with a clear error (do not ship an empty “success”).
+- If **no** block intersects the window → **clamp** the window to the data
+  bounds on disk with a loud `WARN` (changed in v1.4.0; was: fail with a
+  clear error). The gather always ships the closest snapshot the cluster can
+  still produce — a support case for an outage window older than retention
+  must not come back empty. The clamp is recorded in
+  `time-window.json` (`window_clamped: true` + `original_request`) and
+  `retention.txt` (`window_vs_data`):
 
 ```text
-FATAL: no TSDB blocks intersect the requested time window
-  since=2026-01-01T00:00:00Z  until=2026-01-01T01:00:00Z
-  retention_hint=see prometheus-metadata/retention.txt
-  hint: widen the window or verify cluster retention still holds this period
+WARN: requested window [30d .. 29d] does not intersect ANY TSDB block on disk
+  oldest_block=2026-10-02T07:36:50Z  newest_block=2026-10-03T12:00:00Z
+  exporting the closest available data instead (clamped window); retention_hint=see prometheus-metadata/retention.txt
 ```
 
 ---
@@ -324,7 +329,6 @@ Flags on the wrapper are the supported UX; env vars remain for debugging and ima
 All four capabilities implemented in gather v1.3.0 and verified end-to-end with
 `oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:v6 --dest-dir …`
 against this SNO cluster (Prometheus 3.13.2, `MODE=direct`).
-
 - **Size safeguard** — pre-flight budget gate before any copy. Default budget 2Gi,
   `SIZE_POLICY=fail`. Verified: full ~960 MiB export under 2Gi budget → `allow`;
   same export with `100Mi` budget → `FATAL: projected must-gather TSDB export
@@ -352,6 +356,13 @@ against this SNO cluster (Prometheus 3.13.2, `MODE=direct`).
   `MAX_GATHER_BYTES=none`); the remote `tar` pipe treated the *expected*
   live-WAL `file changed as we read it` loss bound as a fatal error. Both
   fixed; see the git log.
+- **Empty window no longer fatal (v1.4.0)** — driven by a real run where
+  `--since 30d --until 29d` hit a TSDB holding only ~1 day of data (retention).
+  Old behavior aborted pre-copy with an empty result — a no-op for the exact
+  support case it should serve. Now the window is clamped to the data on disk
+  with a loud WARN, and the closest snapshot is always shipped. Artifacts:
+  `time-window.json` (`window_clamped`, `original_request`), `retention.txt`
+  (`window_vs_data=request_disjoint_clamped_to_available`).
 
 Residual note (documented, not a defect): `oc adm must-gather` does not
 propagate the payload's non-zero exit code, so operators check `gather.log`
@@ -367,7 +378,7 @@ for `FATAL` (both FATAL messages are stable and machine-grepable per §1.3).
 | Full export over budget, `fail` | Non-zero exit **before** copy; FATAL message with hints |
 | Full export over budget, `warn` | Continues; WARN in `gather.log` |
 | `--since 6h` with matching blocks | Only intersecting blocks present; playback queries work in window |
-| Window with no blocks | FATAL empty-intersection message |
+| Window with no blocks (v1.4.0) | WARN + clamp to available data; export ships closest snapshot; `time-window.json` `window_clamped:true` + `original_request` |
 | Window older than retention | FATAL/WARN citing `retention.txt` |
 | Snapshot mode + window | Uses admin snapshot when available; still filters if needed |
 | Compression on/off | Bit-identical metrics after decompress + playback smoke query |
@@ -408,7 +419,7 @@ for `FATAL` (both FATAL messages are stable and machine-grepable per §1.3).
 ## Acceptance checklist (GitHub-ready)
 
 - [ ] Feature flagged behind documented env/CLI options with sensible defaults.
-- [ ] Error messages are stable enough to scrape in CI (`FATAL: projected must-gather` / `FATAL: no TSDB blocks`).
+- [ ] Error/warning messages are stable enough to scrape in CI (`FATAL: projected must-gather` / `WARN: requested window [..] does not intersect ANY TSDB block`).
 - [ ] Metadata files describe size, window, and retention for every run.
 - [ ] README Troubleshooting table updated with new failure modes.
 - [ ] No secrets in output tree.

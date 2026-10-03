@@ -156,9 +156,13 @@ The gather script itself (v6, what actually runs on this cluster):
     (default) / `none` = off. `SIZE_POLICY=fail` (default) aborts pre-copy with
     a stable `FATAL: projected must-gather TSDB export exceeds size budget`
     block; `warn` continues
-  - `SINCE` / `UNTIL` — time window (`6h`, `2d`, RFC3339, unix, `now`). Only
-    blocks whose range intersects the window are copied; empty intersection →
-    `FATAL: no TSDB blocks intersect the requested time window`
+   - `SINCE` / `UNTIL` — time window (`6h`, `2d`, RFC3339, unix, `now`). Only
+     blocks whose range intersects the window are copied; a window that
+     intersects **no** block (retention already GC'd that period) no longer
+     fails the run (v1.4.0) — it is **clamped to the available data** with a
+     loud `WARN` so the gather always ships the closest snapshot; the clamp is
+     recorded in `time-window.json` (`window_clamped` + `original_request`)
+     and `retention.txt`
   - `INCLUDE_WAL=true|false|auto` (default auto: true when `until` is within 1h
     of now), `COMPRESS=none|zstd|gzip` (default `zstd` ~74% smaller, see the
     feature doc Outcomes)
@@ -213,7 +217,7 @@ du -sh "$P/prometheus-snapshot"
 | host `curl 127.0.0.1:9091` times out but container is up | pasta port-forward flakiness (Bazzite). Query in-container: `podman exec fg-prometheus wget -qO- 'http://127.0.0.1:9090/…'` |
 | Grafana queries return 0 points | instant query at "now" on historical data. Use `start`/`end` inside the block window (see `prometheus-metadata/tsdb-verify.txt`) |
 | gather FATAL `projected must-gather TSDB export exceeds size budget` | v1.3.0 pre-flight budget gate (nothing copied). Narrow `SINCE`/`UNTIL`, raise `MAX_GATHER_BYTES`, or set `SIZE_POLICY=warn`. See `prometheus-metadata/size-budget.txt` |
-| gather FATAL `no TSDB blocks intersect the requested time window` | `SINCE`/`UNTIL` wider than the data on disk (retention deleted older blocks). Check `prometheus-metadata/retention.txt` for effective retention + oldest block time |
+| gather WARN `requested window [..] does not intersect ANY TSDB block on disk` | `SINCE`/`UNTIL` outside the data on disk (retention deleted it). **v1.4.0: no longer fatal** — the window is clamped to the available data and the closest snapshot is exported. Verify `prometheus-metadata/retention.txt` + `time-window.json` (`window_clamped`, `original_request`) to confirm what was really shipped |
 | gather log `zstd compression failed - keeping the unarchived tree only` | image built before the zstd install (Containerfile `dnf -y install zstd`). Rebuild + new tag, or run with `COMPRESS=gzip`/`none` |
 | `prometheus-snapshot/<TS>.tar.zstd` present but playback "no data" | the archive is for transfer only: unpack first (`tar -I zstd -xf <TS>.tar.zstd -C <dir>`) and point `SNAPSHOT_DIR` at the unpacked tree |
 

@@ -1,4 +1,4 @@
-# Selective + Size-Safe TSDB Gather (gather v1.3.0)
+# Selective + Size-Safe TSDB Gather (gather v1.4.0)
 
 How to drive the new safeguard / time-window / retention / compression
 features **from the `oc adm must-gather` command itself** — no wrapper needed.
@@ -90,7 +90,7 @@ demo-run/
 ├── must-gather.logs                        # framework (rsync) log
 ├── timestamp
 └── quay-io-midu-prometheus-tsdb-gather-sha256-<digest>/   # payload
-    ├── version                             # "prometheus-tsdb-must-gather" / "1.3.0"
+    ├── version                             # "prometheus-tsdb-must-gather" / "1.4.0"
     ├── gather.log                          # the full in-cluster run log (read FATAL/WARN here)
     ├── whoami.txt
     ├── prometheus-snapshot/
@@ -185,21 +185,28 @@ FATAL: projected must-gather TSDB export exceeds size budget
 
 To log-and-continue instead: add `--size-policy warn`.
 
-### 4. Export nothing (window older than the data on disk)
+### 4. Window older than the data on disk (now clamps, no longer a hard fail)
 
 ```bash
 oc adm must-gather … --dest-dir $(pwd)/demo-run -- /usr/bin/gather --since 30d --until 29d
 ```
 
-Observed: **aborts pre-copy** (no extract), cites retention:
+As of **v1.4.0** a window that selects **zero** blocks is no longer a hard
+error. Typical cause: retention already GC'd the requested period. The gather
+now **clamps** the window to the available data bounds and ships the closest
+snapshot the cluster can still produce, warning loudly:
 
 ```
-FATAL: no TSDB blocks intersect the requested time window
-  since=30d  until=29d
-  oldest_block=2026-10-02T07:36:50Z  newest_block=2026-10-03T10:00:00Z
-  retention_hint=see prometheus-metadata/retention.txt
-  hint: widen the window (--since/--until) or verify cluster retention still holds this period
+WARN: requested window [30d .. 29d] does not intersect ANY TSDB block on disk
+  oldest_block=2026-10-02T07:36:50Z  newest_block=2026-10-03T12:00:00Z
+  exporting the closest available data instead (clamped window); retention_hint=see prometheus-metadata/retention.txt
+Window: selected 4 of 4 blocks; … clamped=1 effective=[2026-10-02T07:36:50Z .. 2026-10-03T12:00:00Z]
 ```
+
+The clamp is recorded in `time-window.json` (`window_clamped:true` +
+`original_request`) and `retention.txt`
+(`window_vs_data=request_disjoint_clamped_to_available` /
+`requested_since_newer_than_oldest_block`).
 
 ### 5. Uncompressed export (compare / no zstd on the node)
 
@@ -217,7 +224,7 @@ records `status=skipped (COMPRESS=none)`.
 | Capability | Gate / step when | Evidence in output |
 |------------|------------------|--------------------|
 | **1. Size safeguard** | pre-flight, *before* any copy | `size-budget.txt` (`decision=allow\|deny`), `FATAL: projected must-gather TSDB export exceeds size budget` |
-| **2. Time-window export** | pre-flight (select) + extract (copy selected only) | `time-window.json`, `Window: selected N of M`, `FATAL: no TSDB blocks intersect the requested time window` |
+| **2. Time-window export** | pre-flight (select) + extract (copy selected only) | `time-window.json` (`window_clamped`, `original_request`), `Window: selected N of M blocks … clamped=0/1`, `WARN: requested window [..] does not intersect ANY TSDB block on disk` |
 | **3. Retention awareness** | always | `retention.txt` (`retention_effective`, data bounds, `window_vs_data`); **Tier A+B only** — live retention patching is intentionally **not** implemented |
 | **4. Compression** | post-extract (local, CPU) | `compression.txt` (ratio, sha256, unpack cmd), `<ts>.tar.zstd` + `SHA256SUMS` |
 
@@ -255,7 +262,7 @@ Verify integrity without a cluster:
 | Symptom | Cause / fix |
 |---------|-------------|
 | `FATAL: projected must-gather TSDB export exceeds size budget` | Budget gate, nothing copied. `--since/--until` to narrow, `--max-size` to raise, or `--size-policy warn` to continue. See `size-budget.txt` |
-| `FATAL: no TSDB blocks intersect the requested time window` | Window wider than available data (retention deleted older blocks). Widen `--since/--until`; check `retention.txt` |
+| `WARN: requested window [..] does not intersect ANY TSDB block on disk` | Window outside data on disk (retention deleted it). **v1.4.0: no longer fatal** — the window is clamped to the available data and the closest snapshot is exported. Check `retention.txt` + `time-window.json` (`window_clamped`, `original_request`) to confirm what was really shipped |
 | `WARN: remote tar hit the expected live-WAL torn-tail error` | **Expected, not a failure.** The WAL is appended while read; copy stays crash-consistent, re-opening Prometheus replays it. Loss ≤ torn tail of newest in-flight segment |
 | `oc adm must-gather` exits 0 but `gather.log` has `FATAL` | Framework does **not** propagate the payload exit code. Always grep `gather.log` for `FATAL`/`DONE - mode=` |
 | `prometheus-snapshot/<ts>.tar.zstd` present but playback empty | Archive is transfer-only: unpack first (`tar -I zstd -xf … -C dir`), point the prom mount at the **unpacked** tree |
