@@ -81,6 +81,27 @@ INJECT="${INJECT:-command}"            # command (default) | patch
 MOUNT_PATH="/etc/must-gather-kubeconfig"   # MUST match gather's KUBECONFIG_MOUNT_PATH
 GATHER_TIMEOUT="${GATHER_TIMEOUT:-60m}"    # snapshot + oc cp of a large TSDB
 NS_GRACE_SECONDS="${NS_GRACE_SECONDS:-120}"   # keep NS after run: sidecar may still rsync
+# safeguard/env pass-through (gather v1.3.0 + legacy v1.2.0): the must-gather
+# framework accepts NO extra args for the payload, and the bootstrap is the
+# only thing in our hands inside the pod - so these travel as env (the
+# bootstrap exports them right before 'exec /usr/bin/gather').
+#   v1.3.0 (features/safeguard-size-selective-export.md):
+#     SINCE / UNTIL          time window ('6h', '2d', RFC3339, 'now')
+#     MAX_GATHER_BYTES       budget: 512Mi / 2Gi / none  (default 2Gi)
+#     SIZE_POLICY            fail (default) | warn
+#     INCLUDE_WAL            true | false | auto (default auto)
+#     COMPRESS               none | zstd (default) | gzip
+#   v1.2.0 legacy:
+#     GATHER_TSDB_AT takes anything GNU date parses; GATHER_TSDB_MAX_GB caps
+#     the exported copy in GiB (default 5).
+GATHER_TSDB_AT="${GATHER_TSDB_AT:-}"
+GATHER_TSDB_MAX_GB="${GATHER_TSDB_MAX_GB:-}"
+SINCE="${SINCE:-}"
+UNTIL="${UNTIL:-}"
+MAX_GATHER_BYTES="${MAX_GATHER_BYTES:-}"
+SIZE_POLICY="${SIZE_POLICY:-}"
+INCLUDE_WAL="${INCLUDE_WAL:-}"
+COMPRESS="${COMPRESS:-}"
 
 # --- prechecks ----------------------------------------------------------------
 [[ -n "${IMAGE}" ]] \
@@ -158,7 +179,18 @@ if [[ "${INJECT}" == "command" ]]; then
     # a Forbidden/NotFound on the secret fail the whole pipeline (otherwise
     # 'base64 -d' would happily write an EMPTY file and the script would
     # continue with silent broken auth - exactly what the 2026-09-29 run hit).
-    BOOTSTRAP="set -e -o pipefail; mkdir -p ${MOUNT_PATH}; oc get secret ${SECRET_NAME} -n ${NAMESPACE} -o jsonpath={.data.kubeconfig} | base64 -d > ${MOUNT_PATH}/kubeconfig; chmod 600 ${MOUNT_PATH}/kubeconfig; export KUBECONFIG=${MOUNT_PATH}/kubeconfig; echo '[bootstrap] KUBECONFIG=${MOUNT_PATH}/kubeconfig (user: $(oc whoami 2>/dev/null || echo ?))'; exec /usr/bin/gather"
+    # v1.3.0 env exported too; UNSET wrapper vars stay UNSET in the pod so
+    # gather's own defaults (2Gi, fail, auto, zstd, until=now) apply:
+    BOOTSTRAP="set -e -o pipefail; mkdir -p ${MOUNT_PATH}; oc get secret ${SECRET_NAME} -n ${NAMESPACE} -o jsonpath={.data.kubeconfig} | base64 -d > ${MOUNT_PATH}/kubeconfig; chmod 600 ${MOUNT_PATH}/kubeconfig; export KUBECONFIG=${MOUNT_PATH}/kubeconfig"
+    [[ -n "${GATHER_TSDB_AT}" ]]     && BOOTSTRAP+="; export GATHER_TSDB_AT='${GATHER_TSDB_AT}'"
+    [[ -n "${GATHER_TSDB_MAX_GB}" ]] && BOOTSTRAP+="; export GATHER_TSDB_MAX_GB='${GATHER_TSDB_MAX_GB}'"
+    [[ -n "${SINCE}" ]]              && BOOTSTRAP+="; export SINCE='${SINCE}'"
+    [[ -n "${UNTIL}" ]]              && BOOTSTRAP+="; export UNTIL='${UNTIL}'"
+    [[ -n "${MAX_GATHER_BYTES}" ]]   && BOOTSTRAP+="; export MAX_GATHER_BYTES='${MAX_GATHER_BYTES}'"
+    [[ -n "${SIZE_POLICY}" ]]        && BOOTSTRAP+="; export SIZE_POLICY='${SIZE_POLICY}'"
+    [[ -n "${INCLUDE_WAL}" ]]        && BOOTSTRAP+="; export INCLUDE_WAL='${INCLUDE_WAL}'"
+    [[ -n "${COMPRESS}" ]]           && BOOTSTRAP+="; export COMPRESS='${COMPRESS}'"
+    BOOTSTRAP+="; echo \"[bootstrap] KUBECONFIG=${MOUNT_PATH}/kubeconfig (user: $(oc whoami 2>/dev/null || echo ?)) since='${SINCE}' until='${UNTIL}' max='${MAX_GATHER_BYTES}' policy='${SIZE_POLICY}' wal='${INCLUDE_WAL}' compress='${COMPRESS}' at='${GATHER_TSDB_AT}' max_gi='${GATHER_TSDB_MAX_GB}'\"; exec /usr/bin/gather"
     MG_ARGS+=( -- "${BOOTSTRAP}" )
     echo ">> injection mode: command (bootstrap fetches secret into ${MOUNT_PATH}/kubeconfig before gather starts)"
 else

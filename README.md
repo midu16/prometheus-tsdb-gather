@@ -129,6 +129,44 @@ The gather script itself (v6, what actually runs on this cluster):
   /must-gather/prometheus-snapshot/<UTC-ts>` — a TSDB is crash-consistent, the
   local prometheus replays the WAL on open (worst case: torn tail of the newest
   WAL segment). `MODE=snapshot` instead copies `/prometheus/snapshots/<ts>`
+- **export guards** (v1.2.0): after extraction, the **local** copy is checked
+  against a size cap (default **5 GiB**, tunable) and an optional point-in-time
+  filter; the live pod is never touched. If the copy exceeds the cap, the
+  **oldest blocks are pruned first** (ULID sort = chronological; newest blocks +
+  WAL/chunks_head kept) until it fits. With a timestamp set, blocks whose
+  `minTime` starts **after** that instant are dropped (block granularity — the
+  TSDB has no finer offline unit; the WAL is kept as-is). Everything pruned is
+  recorded in `prometheus-metadata/export-guards.txt`. Flags/env:
+  - `--max-gb <n>` / `GATHER_TSDB_MAX_GB` — cap in GiB (default 5)
+  - `--at <ts>` / `GATHER_TSDB_AT` — anything GNU `date` parses:
+    `2026-09-29T14:00:00Z`, `"2026-09-29 14:00"`, `"24 hours ago"`, unix seconds
+  - `gather --help` prints usage; a bad timestamp or cap is a hard error
+    (exit 64) before anything runs
+  - passing them to the **in-pod** run: the framework accepts no payload args,
+    so the bootstrap (INJECT=command mode) exports them before
+    `exec /usr/bin/gather` — set them on the wrapper:
+    `GATHER_TSDB_AT="2026-09-29T14:00:00Z" GATHER_TSDB_MAX_GB=5 ./run-must-gather.sh <image>`
+    (patch mode has no hook into the pod's env; use command mode when guarding
+    matters, e.g. INJECT=patch + hand-run gather via `oc debug` with the env set)
+- **safeguard + selective export** (v1.3.0,
+  `features/safeguard-size-selective-export.md`): pre-flight gate *before* any
+  byte leaves the pod — block inventory → time-window selection → retention
+  detect → size budget. Flags/env (all forwarded by the wrapper):
+  - `MAX_GATHER_BYTES` / `--max-size` — projected-export budget, `512Mi`/`2Gi`
+    (default) / `none` = off. `SIZE_POLICY=fail` (default) aborts pre-copy with
+    a stable `FATAL: projected must-gather TSDB export exceeds size budget`
+    block; `warn` continues
+  - `SINCE` / `UNTIL` — time window (`6h`, `2d`, RFC3339, unix, `now`). Only
+    blocks whose range intersects the window are copied; empty intersection →
+    `FATAL: no TSDB blocks intersect the requested time window`
+  - `INCLUDE_WAL=true|false|auto` (default auto: true when `until` is within 1h
+    of now), `COMPRESS=none|zstd|gzip` (default `zstd` ~74% smaller, see the
+    feature doc Outcomes)
+  - wrapper: `SINCE=6h MAX_GATHER_BYTES=1Gi ./run-must-gather.sh <image>`
+  - artifacts: `prometheus-metadata/size-budget.txt`, `time-window.json`,
+    `retention.txt`, `block-inventory.tsv`; compressed runs also ship
+    `prometheus-snapshot/<TS>.tar.zst` + `SHA256SUMS` (unpack:
+    `tar -I zstd -xf <TS>.tar.zst -C <dir>`)
 - **metadata**: node/pod JSON, `pod describe`, log tail, rendered config (tokens
   redacted), in-cluster `promtool tsdb list` + `analyze` of the newest block
   (promtool 3.x has **no** `tsdb verify`), structural check of the local copy
@@ -174,6 +212,10 @@ du -sh "$P/prometheus-snapshot"
 | `podman-compose up -d` hangs | this host: old docker-compose-v1 delegation / slow pull. Pre-pull both images, use standalone `podman-compose`, `timeout 240 … up -d` |
 | host `curl 127.0.0.1:9091` times out but container is up | pasta port-forward flakiness (Bazzite). Query in-container: `podman exec fg-prometheus wget -qO- 'http://127.0.0.1:9090/…'` |
 | Grafana queries return 0 points | instant query at "now" on historical data. Use `start`/`end` inside the block window (see `prometheus-metadata/tsdb-verify.txt`) |
+| gather FATAL `projected must-gather TSDB export exceeds size budget` | v1.3.0 pre-flight budget gate (nothing copied). Narrow `SINCE`/`UNTIL`, raise `MAX_GATHER_BYTES`, or set `SIZE_POLICY=warn`. See `prometheus-metadata/size-budget.txt` |
+| gather FATAL `no TSDB blocks intersect the requested time window` | `SINCE`/`UNTIL` wider than the data on disk (retention deleted older blocks). Check `prometheus-metadata/retention.txt` for effective retention + oldest block time |
+| gather log `zstd compression failed - keeping the unarchived tree only` | image built before the zstd install (Containerfile `dnf -y install zstd`). Rebuild + new tag, or run with `COMPRESS=gzip`/`none` |
+| `prometheus-snapshot/<TS>.tar.zst` present but playback "no data" | the archive is for transfer only: unpack first (`tar -I zstd -xf <TS>.tar.zst -C <dir>`) and point `SNAPSHOT_DIR` at the unpacked tree |
 
 ## Notes & caveats
 

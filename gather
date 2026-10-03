@@ -10,6 +10,53 @@
 #   3. Writes /must-gather/version (line 1: product, line 2: version)
 #   4. Must NOT leak sensitive data (tokens, certs) into /must-gather
 #
+# SAFEGUARDS (v1.3.0) -- see features/safeguard-size-selective-export.md
+#
+# Size budget (pre-flight gate, BEFORE any bytes are copied):
+#   --max-size <bytes|1Gi|512Mi|...>   or   MAX_GATHER_BYTES=<bytes>
+#       projected export (sum of SELECTED blocks + WAL if included) is
+#       compared against the budget; default 2 GiB, "none" = disabled.
+#   --size-policy fail|warn            or   SIZE_POLICY
+#       fail (default): FATAL + actionable error message before the copy.
+#       warn: log loudly, continue.
+#   On a budget miss the script prints a stable, machine-grepable block
+#   (FATAL: projected must-gather TSDB export exceeds size budget ...) and
+#   writes prometheus-metadata/size-budget.txt, then exits non-zero
+#   (policy=fail) without copying anything.
+#
+# Time-window export (selective, source-side: only selected paths leave the
+#   prometheus pod; block granularity = complete ULID dirs, never split):
+#   --since <ts>   or   SINCE     e.g. 2026-09-29T10:00:00Z, 6h, 2d,
+#                                 "24 hours ago", unix seconds, 'now'
+#   --until <ts>   or   UNTIL     same formats; default 'now'
+#   --include-wal true|false      or   INCLUDE_WAL
+#       copy WAL + chunks_head when the window reaches the head.
+#       Default: true when until is within 1h of now, else false.
+#   Blocks whose [minTime,maxTime] INTERSECTS [since,until] are copied; all
+#   other blocks never leave the pod. No intersecting block -> FATAL before
+#   the copy. Retention is detected and compared against the window; a
+#   window older than retention fails with a hint (Tier A+B of the feature
+#   doc; live retention patching is intentionally NOT implemented).
+#   Artifacts: time-window.json, retention.txt.
+#
+# Compression (measured 2026-10-02 on a 1.1GB SNO TSDB, see the feature doc
+#   Outcomes): zstd -6 yields ~74% size reduction in ~0.5s -> the default.
+#   --compress none|zstd|gzip        or   COMPRESS
+#       the extracted copy is archived as
+#         prometheus-snapshot/<TS>.tar.zst   (or .tar.gz) + SHA256SUMS
+#       after extraction (the block tree itself stays intact inside the
+#       pod-side copy step - compression runs locally, CPU-bound, cheap).
+#       Unpack for playback:  tar -I zstd -xf <TS>.tar.zst -C <dir>
+#       (PLAYBACK still mounts the UNPACKED dir; the archive is for
+#       transfer/storage, and both forms verify via SHA256SUMS).
+#
+# Legacy (v1.2.0, still supported post-copy, on the LOCAL copy):
+#   --max-gb <n>   or   GATHER_TSDB_MAX_GB=<n>     (default 5)
+#   --at <ts>      or   GATHER_TSDB_AT=<ts>
+#   These prune the local copy after extraction (oldest blocks first); the
+#   pre-flight budget above is the recommended gate - --max-gb/--at remain
+#   for backward compatibility with existing playbooks.
+#
 # AUTH MODEL
 #   The operator's local kubeconfig (cluster-admin) is delivered by
 #   run-must-gather.sh, which creates a Secret and makes the framework's
@@ -43,6 +90,203 @@
 #   4.15-compatible.
 # =============================================================================
 set -uo pipefail
+
+# ---------------------------------------------------------------------------
+# Flags (the must-gather contract prefers zero-arg, but the framework passes
+# through extra args from `oc adm must-gather --cmd "gather <args>"`; they are
+# all optional and overrideable by env for in-pod hand runs. The wrapper
+# run-must-gather.sh forwards its own flags as env - prefer the wrapper.)
+#
+#   Size safeguard:
+#     --max-size <size>    bytes, or N{K,M,G,T}{i,B} (default: 2Gi; none=off)
+#                          (env: MAX_GATHER_BYTES)
+#     --size-policy fail|warn   (env: SIZE_POLICY, default fail)
+#   Time-window export:
+#     --since <ts>         RFC3339 / "6h" / "2d" / "24 hours ago" / epoch (env: SINCE)
+#     --until <ts>         same, default now                    (env: UNTIL)
+#     --include-wal true|false  copy WAL+chunks_head (env: INCLUDE_WAL;
+#                          default true when until is within an hour of now)
+#   Compression:
+#     --compress none|zstd|gzip   (env: COMPRESS, default zstd)
+#   Legacy post-copy guards (v1.2.0, applied to the LOCAL copy after extract):
+#     --max-gb <n>         cap in GiB, oldest blocks pruned (env: GATHER_TSDB_MAX_GB, default 5)
+#     --at <ts>            prune blocks starting after <ts> (env: GATHER_TSDB_AT)
+#   -h, --help             print usage
+# ---------------------------------------------------------------------------
+usage() {
+    cat <<'EOF'
+gather [options]
+Size safeguard (pre-flight, before any copy):
+  --max-size <size>    projected-export budget: bytes, or N{K,M,G,T}{i,B}
+                       (default 2Gi; 'none' disables)   (env: MAX_GATHER_BYTES)
+  --size-policy fail|warn
+                       fail = abort with FATAL before the copy (default)
+                       warn = log loudly and continue    (env: SIZE_POLICY)
+Time-window export (selective, block-granular, source-side):
+  --since <ts>         inclusive lower bound (env: SINCE)
+  --until <ts>         inclusive upper bound, default now (env: UNTIL)
+  --include-wal true|false
+                       copy WAL + chunks_head            (env: INCLUDE_WAL;
+                       auto: true when until is within 1h of now)
+  <ts> = RFC3339 (2026-09-29T10:00:00Z), relative (6h, 2d, 'now'),
+       anything GNU date parses, or unix seconds.
+Compression:
+  --compress none|zstd|gzip
+                       archive the extracted copy (default: zstd -6)
+                       (env: COMPRESS)
+Legacy post-copy guards (local copy; see v1.2.0 notes):
+  --max-gb <n>         cap the exported copy to <n> GiB (default: 5)
+                 (env: GATHER_TSDB_MAX_GB)
+  --at <ts>            prune local blocks starting after <ts>
+                 (env: GATHER_TSDB_AT)
+  -h, --help           this help
+EOF
+}
+
+MAX_SIZE="${MAX_GATHER_BYTES:-2Gi}"
+SIZE_POLICY="${SIZE_POLICY:-fail}"
+SINCE="${SINCE:-}"
+UNTIL="${UNTIL:-now}"
+INCLUDE_WAL="${INCLUDE_WAL:-auto}"
+COMPRESS="${COMPRESS:-zstd}"
+# legacy
+MAX_GB="${GATHER_TSDB_MAX_GB:-5}"
+AT_TS="${GATHER_TSDB_AT:-}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --max-size)     MAX_SIZE="${2:?--max-size needs a value}"; shift 2 ;;
+        --size-policy)  SIZE_POLICY="${2:?--size-policy needs a value}"; shift 2 ;;
+        --since)        SINCE="${2:?--since needs a value}"; shift 2 ;;
+        --until)        UNTIL="${2:?--until needs a value}"; shift 2 ;;
+        --include-wal)  INCLUDE_WAL="${2:?--include-wal needs a value}"; shift 2 ;;
+        --compress)     COMPRESS="${2:?--compress needs a value}"; shift 2 ;;
+        --max-gb)       MAX_GB="${2:?--max-gb needs a value}"; shift 2 ;;
+        --at)           AT_TS="${2:?--at needs a value}"; shift 2 ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              echo "gather: unknown flag: $1" >&2; usage >&2; exit 64 ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# flag validation + parsing (all hard errors up front, exit 64)
+# ---------------------------------------------------------------------------
+human_size_to_bytes() {
+    # 512, 512K, 512Mi, 2G, none... -> integer bytes; echoes none for none|""
+    local s="$1"
+    [[ -z "${s}" || "${s,,}" == "none" || "${s,,}" == "off" || "${s,,}" == "disabled" ]] \
+        && { echo none; return; }
+    [[ "${s}" =~ ^([0-9]+)([A-Za-z]*)$ ]] || { echo ""; return; }
+    local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    case "${unit}" in
+        ""|"B"|"b")                 echo $(( num )) ;;
+        "K"|"k"|"Kb"|"kb"|"Ki"|"ki")          echo $(( num * 1024 )) ;;
+        "M"|"m"|"Mb"|"mb"|"Mi"|"mi")          echo $(( num * 1024 * 1024 )) ;;
+        "G"|"g"|"Gb"|"gb"|"Gi"|"gi")          echo $(( num * 1024 * 1024 * 1024 )) ;;
+        "T"|"t"|"Tb"|"tb"|"Ti"|"ti")          echo $(( num * 1024 * 1024 * 1024 * 1024 )) ;;
+        *) echo "" ;;
+    esac
+}
+
+MAX_BYTES="$(human_size_to_bytes "${MAX_SIZE}")"
+if [[ "${MAX_BYTES}" == "none" ]]; then
+    MAX_BYTES=""                    # budget disabled
+elif [[ -z "${MAX_BYTES}" ]]; then
+    echo "gather: cannot parse --max-size '${MAX_SIZE}' (bytes or N[K|M|G|T][iB], or 'none')" >&2
+    exit 64
+fi
+
+case "${SIZE_POLICY}" in
+    fail|warn) : ;;
+    *) echo "gather: --size-policy must be 'fail' or 'warn', got: ${SIZE_POLICY}" >&2; exit 64 ;;
+esac
+case "${COMPRESS}" in
+    none|zstd|gzip) : ;;
+    *) echo "gather: --compress must be none|zstd|gzip, got: ${COMPRESS}" >&2; exit 64 ;;
+esac
+case "${INCLUDE_WAL}" in
+    true|false|auto) : ;;
+    *) echo "gather: --include-wal must be true|false|auto, got: ${INCLUDE_WAL}" >&2; exit 64 ;;
+esac
+# legacy --max-gb
+[[ "${MAX_GB}" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "gather: --max-gb must be a positive integer, got: ${MAX_GB}" >&2; exit 64; }
+LEGACY_MAX_BYTES=$(( MAX_GB * 1024 * 1024 * 1024 ))
+
+# Prometheus-style relative duration ('6h', '2d', '3d12h', '90m', '12s')
+# -> unix seconds in the PAST. GNU date does NOT parse '6h' as a duration
+# (it means 06:00 UTC!) and '1w' is not a GNU unit either - so the
+# Prometheus letter format is translated to GNU relative syntax
+# ('3d12h' -> 'now - 3 days - 12 hours'). Note 'now - X ago' is WRONG
+# (verified: 'ago' is ignored, the relative part then re-anchors), the
+# correct form is 'now - X <unit>'.
+parse_rel_seconds() {
+    local s="$1" units=""
+    while [[ "${s}" =~ ^([0-9]+)([hdwms]) ]]; do
+        local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+        case "${u}" in
+            d) units+="- ${n} days " ;;
+            w) units+="- $(( n * 7 )) days " ;;
+            h) units+="- ${n} hours " ;;
+            m) units+="- ${n} minutes " ;;
+            s) units+="- ${n} seconds " ;;
+        esac
+        s="${s:${#BASH_REMATCH[0]}}"
+    done
+    [[ -z "${s}" && -n "${units}" ]] || return 1
+    date -u -d "now ${units}" +%s 2>/dev/null
+}
+
+# <ts> -> unix seconds: 'now', Prometheus relative (6h/2d/3d12h/90m),
+# GNU-date strings ("24 hours ago", absolute RFC3339), epoch seconds.
+# Emitted empty on failure.
+parse_ts_seconds() {
+    local t="$1" r
+    [[ -n "${t}" ]] || return 1
+    [[ "${t}" =~ ^-?now$ ]] && t="now"
+    if [[ "${t}" =~ ^[0-9]+$ ]]; then
+        echo "${t}"; return
+    fi
+    # Prometheus letter-durations FIRST: date -d '6h' would silently mean
+    # 06:00 UTC (verified pitfall). '6H' etc. is normalized to the
+    # Prometheus lowercase form; the match requires NUMBER+UNIT pairs only,
+    # so '6 hours' / '3d12h-ish' prose never enters this branch.
+    if [[ "${t,,}" =~ ^([0-9]+[hdwms])+$ ]]; then
+        r="$(parse_rel_seconds "${t,,}")" && { echo "${r}"; return; }
+    fi
+    date -u -d "${t}" +%s 2>/dev/null || date -u -d "now ${t}" +%s 2>/dev/null
+}
+
+SINCE_SECONDS=""
+UNTIL_SECONDS=""
+if [[ -n "${SINCE}" ]]; then
+    SINCE_SECONDS="$(parse_ts_seconds "${SINCE}")" \
+        || { echo "gather: cannot parse --since '${SINCE}'" >&2; exit 64; }
+    if [[ -z "${SINCE_SECONDS}" ]]; then
+        echo "gather: cannot parse --since '${SINCE}'" >&2; exit 64
+    fi
+fi
+UNTIL_SECONDS="$(parse_ts_seconds "${UNTIL}")"
+[[ -n "${UNTIL_SECONDS}" ]] \
+    || { echo "gather: cannot parse --until '${UNTIL}'" >&2; exit 64; }
+if [[ -n "${SINCE_SECONDS}" ]] && (( SINCE_SECONDS > UNTIL_SECONDS )); then
+    echo "gather: --since (${SINCE}) is after --until (${UNTIL})" >&2; exit 64
+fi
+
+# legacy --at (kept for v1.2.0 playbooks)
+AT_SECONDS=""
+if [[ -n "${AT_TS}" ]]; then
+    AT_SECONDS=$(date -u -d "${AT_TS}" +%s 2>/dev/null) \
+        || { echo "gather: cannot parse --at timestamp: ${AT_TS}" >&2; exit 64; }
+fi
+
+# window is 'active' when the operator asked for less than everything:
+# a since bound, or an until that is not the literal default 'now'
+# (a past until also prunes newer blocks - e.g. --at-style point exports)
+WINDOW_ACTIVE=0
+if [[ -n "${SINCE_SECONDS}" || "${UNTIL}" != "now" ]]; then
+    WINDOW_ACTIVE=1
+fi
 
 # ---------------------------------------------------------------------------
 # Configuration / environment
@@ -100,8 +344,313 @@ mkdir -p "${OUT_DIR}" "${TSDB_OUT_DIR}" "${METADATA_DIR}"
 # ---------------------------------------------------------------------------
 {
     echo "prometheus-tsdb-must-gather"
-    echo "1.1.0"
+    echo "1.3.0"
 } > "${OUT_DIR}/version"
+
+# ---------------------------------------------------------------------------
+# export_tsdb_guard <dir>: enforce the size cap and --at point-in-time filter
+# on a LOCAL TSDB copy (never the live pod).
+#
+# Blocks are the only unit that can be dropped safely offline: each block dir
+# is self-contained (meta.json + index + chunks) and a prometheus opening the
+# remaining blocks + WAL loads exactly what is present. Prune order:
+#   1. --at   : drop blocks whose minTime is AFTER the requested instant
+#               (block granularity; the WAL is kept - it holds recent head
+#               data and the re-opening prometheus replays it as-is)
+#   2. size   : while the copy exceeds the cap, drop the OLDEST block first
+#               (ULID sort == chronological order) until under the cap
+# ---------------------------------------------------------------------------
+export_tsdb_guard() {
+    local dir="$1"
+    local report="${METADATA_DIR}/export-guards.txt"
+    local pruned_at="" pruned_size="" kept_count=0 final_size=0
+
+    # collect: name \t minTime(ms) \t size(bytes)  for every block dir
+    local blocks=""
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] && blocks+="${line}"$'\n'
+    done < <(
+        for b in "${dir}"/*/; do
+            [[ -d "${b}" && -f "${b}meta.json" ]] || continue
+            local n; n=$(basename "${b}")
+            [[ "${n}" =~ ^[0-9A-Z]{26}$ ]] || continue
+            local mt sz
+            mt=$(jq -r '.minTime // empty' "${b}meta.json" 2>/dev/null)
+            [[ "${mt}" =~ ^[0-9]+$ ]] || mt=0
+            sz=$(find "${b}" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+            printf '%s\t%s\t%s\n' "${n}" "${mt}" "${sz:-0}"
+        done
+    )
+
+    # -- at filter -------------------------------------------------------
+    if [[ -n "${AT_SECONDS}" ]]; then
+        local kept="" dropped=""
+        while IFS=$'\t' read -r n mt sz; do
+            [[ -n "${n}" ]] || continue
+            if (( mt / 1000 > AT_SECONDS )); then
+                dropped+="${n} "
+                rm -rf -- "${dir}/${n}"
+            else
+                kept+="${n} "
+            fi
+        done <<< "${blocks}"
+        if [[ -n "${dropped}" ]]; then
+            pruned_at="${dropped}"
+            log "Guard --at: pruned blocks starting after $(date -u -d "@${AT_SECONDS}" +%Y-%m-%dT%H:%M:%SZ): ${dropped}"
+        fi
+    fi
+
+    # -- size cap --------------------------------------------------------
+    local total name
+    total=$(du -sb -- "${dir}" 2>/dev/null | awk '{print $1}')
+    total=${total:-0}
+    if (( total > LEGACY_MAX_BYTES )); then
+        log "Guard size: copy is $(( total / 1024 / 1024 )) MiB - over ${MAX_GB} GiB cap; pruning oldest blocks"
+        while (( total > LEGACY_MAX_BYTES )); do
+            # oldest remaining block (ULID sort = chronological)
+            name=$(ls -1 "${dir}" 2>/dev/null | grep -E '^[0-9A-Z]{26}$' | sort | \
+                   while read -r c; do
+                       [[ -f "${dir}/${c}/meta.json" ]] && { echo "${c}"; break; }
+                   done)
+            if [[ -z "${name}" ]]; then
+                warn "Guard size: cannot reach cap by pruning (WAL/chunks_head alone exceed ${MAX_GB} GiB)"
+                break
+            fi
+            local bsz
+            bsz=$(du -sb -- "${dir}/${name}" 2>/dev/null | awk '{print $1}')
+            bsz=${bsz:-0}
+            rm -rf -- "${dir}/${name}"
+            total=$(( total - bsz ))
+            pruned_size+="${name} "
+            log "Guard size: removed oldest block ${name} -> $(( total / 1024 / 1024 )) MiB"
+        done
+    fi
+
+    # -- report ----------------------------------------------------------
+    kept_count=$(ls -1 "${dir}" 2>/dev/null | grep -cE '^[0-9A-Z]{26}$' || true)
+    final_size=$(du -sb -- "${dir}" 2>/dev/null | awk '{print $1}')
+    {
+        echo "max_cap_gi=${MAX_GB}"
+        echo "at_timestamp=${AT_TS:-(not set)}"
+        echo "at_seconds=${AT_SECONDS:-(not set)}"
+        echo "pruned_blocks_after_at=${pruned_at:-(none)}"
+        echo "pruned_blocks_for_size=${pruned_size:-(none)}"
+        echo "blocks_remaining=${kept_count}"
+        echo "final_copy_bytes=${final_size:-0}"
+        echo "final_copy_under_cap=$( (( ${final_size:-0} <= LEGACY_MAX_BYTES )) && echo yes || echo no )"
+        [[ -n "${pruned_at}${pruned_size}" ]] \
+            && echo "note=export is PRUNED: missing blocks listed above; WAL kept intact"
+    } > "${report}"
+}
+
+# ---------------------------------------------------------------------------
+# REMOTE BLOCK INVENTORY (source-side, used by window selection + budget):
+#   one line per compacted block dir:  ULID<TAB>minTime_s<TAB>maxTime_s<TAB>size_bytes
+# parsed from meta.json with awk (the prometheus container has no jq; the
+# remote sh is dash - POSIX only, no bash arrays). minTime/maxTime are
+# millis in meta.json. Blocks not listed here exist only inside the pod.
+# ---------------------------------------------------------------------------
+remote_meta_field() {
+    # $1=block ULID  $2=field (minTime|maxTime): one remote awk pass, no shell
+    # wrapper (the prometheus container has no jq). meta.json is pretty
+    # printed, one key per line ("\t\"minTime\"": 12345,): split on ':',
+    # match the wanted key field, take the next field.
+    oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        awk -F: -v f="${2}" '{for (i=1;i<=NF;i++) {t=$i; gsub(/[ \t\""]/,"",t); if (t==f) {v=$(i+1); gsub(/[^0-9]/,"",v); if (v ~ /^[0-9]+$/) {print v; exit}}}}' \
+            "${PROM_DATA_DIR}/$1/meta.json" 2>/dev/null
+}
+
+remote_block_inventory() {
+    # one line per compacted block dir:  ULID<TAB>minTime_s<TAB>maxTime_s<TAB>bytes
+    oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        sh -c 'ls -1 '"${PROM_DATA_DIR}"' 2>/dev/null' \
+        | while IFS= read -r n; do
+            [[ "${n}" =~ ^[0-9A-Z]{26}$ ]] || continue
+            local mt xt sz
+            mt=$(remote_meta_field "${n}" minTime)
+            xt=$(remote_meta_field "${n}" maxTime)
+            sz=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+                du -sb "${PROM_DATA_DIR}/${n}" 2>/dev/null | awk '{print $1}')
+            [[ -n "${mt}" && "${mt}" =~ ^[0-9]+$ ]] || mt=0
+            [[ -n "${xt}" && "${xt}" =~ ^[0-9]+$ ]] || xt=$(( mt + 3600000 ))
+            [[ -n "${sz}" && "${sz}" =~ ^[0-9]+$ ]] || sz=0
+            printf '%s\t%s\t%s\t%s\n' "${n}" $(( mt / 1000 )) $(( xt / 1000 )) "${sz}"
+        done
+}
+
+# size of one pod dir in bytes (0 on failure)
+remote_dir_bytes() {
+    local p="$1" v
+    v=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        du -sb "${PROM_DATA_DIR}/${p}" 2>/dev/null | awk '{print $1}')
+    [[ -n "${v}" && "${v}" =~ ^[0-9]+$ ]] && echo "${v}" || echo 0
+}
+
+# ---------------------------------------------------------------------------
+# TIME-WINDOW SELECTION (feature: selective export).
+#   INVOCATION: select_window "<inventory lines>"
+#   SELECTED_BLOCKS : ULIDs whose [min, max] INTERSECTS [since, until]
+#   EXCLUDED_BLOCKS : the rest (never leave the pod)
+#   WAL_INCLUDED    : 1/0 (INCLUDE_WAL resolution: auto -> 1 when the window
+#                     reaches the head, i.e. until >= now - 3600s)
+#   OLDEST_MS / NEWEST_MS : data bounds actually present on the PVC
+# Fails hard (stable message) when nothing intersects the window.
+# ---------------------------------------------------------------------------
+SELECTED_BLOCKS=""
+EXCLUDED_BLOCKS=""
+WAL_INCLUDED=0
+OLDEST_MS=0
+NEWEST_MS=0
+
+select_window() {
+    local inv="$1"
+    local now_s; now_s=$(date -u +%s)
+    # INCLUDE_WAL resolution ('auto': window touches the last hour)
+    if [[ "${INCLUDE_WAL}" == "auto" ]]; then
+        if (( UNTIL_SECONDS >= now_s - 3600 )); then WAL_INCLUDED=1; else WAL_INCLUDED=0; fi
+    else
+        [[ "${INCLUDE_WAL}" == "true" ]] && WAL_INCLUDED=1
+    fi
+
+    [[ -n "${inv}" ]] \
+        || fail "no compacted TSDB blocks found in ${PROM_DATA_DIR} (only head/WAL?) - cannot select a window"
+
+    local n mt xt kept=0
+    while IFS=$'\t' read -r n mt xt _sz; do
+        [[ -n "${n}" ]] || continue
+        local mt_ms=$(( mt * 1000 )) xt_ms=$(( xt * 1000 ))
+        if (( mt_ms < OLDEST_MS || OLDEST_MS == 0 )); then OLDEST_MS=${mt_ms}; fi
+        if (( xt_ms > NEWEST_MS )); then NEWEST_MS=${xt_ms}; fi
+        if [[ -n "${SINCE_SECONDS}" ]] && (( xt_ms < SINCE_SECONDS * 1000 )); then
+            EXCLUDED_BLOCKS+="${n} "
+            continue
+        fi
+        if [[ "${UNTIL}" != "now" ]] && (( mt_ms > UNTIL_SECONDS * 1000 )); then
+            EXCLUDED_BLOCKS+="${n} "
+            continue
+        fi
+        SELECTED_BLOCKS+="${n} "
+        kept=1
+    done <<< "${inv}"
+    if [[ ${kept} -eq 0 && ${WINDOW_ACTIVE} -eq 1 ]]; then
+        # windowless (full) runs select everything; only an explicit window
+        # can come back empty, and an empty window is a hard error (contract)
+        log "FATAL: no TSDB blocks intersect the requested time window"
+        log "  since=${SINCE:-<oldest>}  until=${UNTIL}"
+        log "  oldest_block=$(date -u -d "@$(( OLDEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)  newest_block=$(date -u -d "@$(( NEWEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+        log "  retention_hint=see prometheus-metadata/retention.txt"
+        log "  hint: widen the window (--since/--until) or verify cluster retention still holds this period"
+        exit 1
+    fi
+    log "Window: selected $(tr ' ' '\n' <<<"${SELECTED_BLOCKS}" | grep -c .) of $(tr ' ' '\n' <<<"${inv}" | grep -c .) blocks; selected=[${SELECTED_BLOCKS}] excluded=[${EXCLUDED_BLOCKS:-(none)}] wal_included=${WAL_INCLUDED}"
+}
+
+# ---------------------------------------------------------------------------
+# RETENTION DETECTION (tier A of the feature: always; tier B: compare window)
+# Effective retention = prometheus CR spec.retention, else startup flag,
+# else 'unknown'. Data bounds come from the block inventory above.
+# ---------------------------------------------------------------------------
+RETENTION_EFFECTIVE="unknown"
+retention_detect() {
+    local cr
+    cr=$(oc get -n "${MON_NS}" prometheus k8s -o jsonpath='{.spec.retention}' 2>/dev/null || true)
+    [[ -n "${cr}" ]] || cr=$(oc get -n "${MON_NS}" pod "${PROM_POD}" \
+        -o jsonpath='{range .spec.containers[?(@.name=="prometheus")].args[*]}{.}{"\n"}{end}' 2>/dev/null \
+        | grep -oE -- '--storage\.tsdb\.retention[.a-z]*=[0-9a-zA-Z]+' | head -1 || true)
+    [[ -n "${cr}" ]] && RETENTION_EFFECTIVE=$(grep -oE '[0-9]+[a-zA-Z]+' <<<"${cr}" | head -1)
+    local now_s; now_s=$(date -u +%s)
+    local verdict="ok"
+    if [[ -n "${SINCE_SECONDS}" ]]; then
+        # data on disk starts at OLDEST_MS; nothing older can exist
+        if (( OLDEST_MS > SINCE_SECONDS * 1000 )); then
+            verdict="window_older_than_available_data"
+        fi
+    fi
+    {
+        echo "retention_effective=${RETENTION_EFFECTIVE}"
+        echo "retention_source=prometheus CR spec.retention / --storage.tsdb.retention* flag"
+        echo "data_oldest_block=$(( OLDEST_MS / 1000 ))s  ($(date -u -d "@$(( OLDEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null))"
+        echo "data_newest_block=$(( NEWEST_MS / 1000 ))s  ($(date -u -d "@$(( NEWEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null))"
+        echo "requested_since=${SINCE:-<oldest>}"
+        echo "requested_until=${UNTIL}"
+        echo "window_vs_data=${verdict}"
+        echo "note=tier A(detect)+B(advise) only: live retention patching (tier C) intentionally not implemented"
+    } > "${METADATA_DIR}/retention.txt"
+    if [[ "${verdict}" == "window_older_than_available_data" ]]; then
+        log "FATAL: requested window starts before the oldest data on disk"
+        log "  since=${SINCE}  oldest_block=$(date -u -d "@$(( OLDEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+        log "  retention_hint=see prometheus-metadata/retention.txt (retention=${RETENTION_EFFECTIVE})"
+        log "  hint: widen --since, or (break-glass lab clusters only) raise retention - not implemented by this toolkit"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SIZE BUDGET GATE (feature: safeguard, pre-flight, BEFORE the copy)
+#   projected = sum(selected block sizes) + (wal+chunks_head if included)
+#   [windowless runs project the full TSDB - same number as the inventory]
+# Writes prometheus-metadata/size-budget.txt; honors SIZE_POLICY.
+# INVOCATION: size_budget_gate "<inventory lines>"
+# ---------------------------------------------------------------------------
+size_budget_gate() {
+    local inv="$1"
+    local projected=0 n mt xt sz add
+    while IFS=$'\t' read -r n mt xt sz; do
+        [[ -n "${n}" ]] || continue
+        case " ${SELECTED_BLOCKS} " in *" ${n} "*) projected=$(( projected + sz )) ;; esac
+    done <<< "${inv}"
+    if (( WAL_INCLUDED )); then
+        add=$(( $(remote_dir_bytes "wal") + $(remote_dir_bytes "chunks_head") ))
+        projected=$(( projected + add ))
+    fi
+    local budget_display="${MAX_SIZE}"
+    [[ -n "${MAX_BYTES}" ]] && budget_display="${MAX_SIZE} (${MAX_BYTES} bytes)"
+    local decision="disabled"
+    if [[ -n "${MAX_BYTES}" ]]; then
+        if (( projected > MAX_BYTES )); then
+            decision="deny"
+        else
+            decision="allow"
+        fi
+    fi
+    {
+        echo "budget=${MAX_SIZE:-(unset)}"
+        echo "policy=${SIZE_POLICY}"
+        echo "mode=${MODE}"
+        echo "window=${WINDOW_ACTIVE:0:1} since=${SINCE:-(oldest)} until=${UNTIL}"
+        echo "blocks_selected=$(tr ' ' '\n' <<<"${SELECTED_BLOCKS:-(full)}" | grep -c .)/$(tr ' ' '\n' <<<"${SELECTED_BLOCKS} ${EXCLUDED_BLOCKS}" | grep -c .)"
+        echo "wal_included=${WAL_INCLUDED}"
+        echo "projected_bytes=${projected}"
+        echo "projected_human=$(awk -v b=${projected} 'BEGIN{printf "%.1f MiB", b/1048576}')"
+        echo "budget_bytes=${MAX_BYTES:-(disabled)}"
+        echo "compress=${COMPRESS}"
+        echo "decision=${decision}"
+        [[ "${decision}" == "allow" ]] && echo "note=projection computed from remote block inventory (pre-copy); compression applied AFTER extraction does not change what the gather pod has to hold"
+    } > "${METADATA_DIR}/size-budget.txt"
+    case "${decision}" in
+        deny)
+            if [[ "${SIZE_POLICY}" == "warn" ]]; then
+                log "WARN: projected must-gather TSDB export exceeds size budget (policy=warn, continuing)"
+                log "  projected=$(( projected / 1024 / 1024 ))MiB  budget=$(awk -v b=${MAX_BYTES} 'BEGIN{printf "%.1f MiB", b/1048576}')  policy=warn"
+            else
+                # stable, machine-grepable contract (feature doc §1.3)
+                log "FATAL: projected must-gather TSDB export exceeds size budget"
+                log "  projected=$(( projected / 1024 / 1024 ))MiB  budget=$(awk -v b=${MAX_BYTES} 'BEGIN{printf "%.1f MiB", b/1048576}')  policy=${SIZE_POLICY}"
+                log "  mode=${MODE}  blocks_selected=$(tr ' ' '\n' <<<"${SELECTED_BLOCKS}" | grep -c .)/$(tr ' ' '\n' <<<"${SELECTED_BLOCKS} ${EXCLUDED_BLOCKS}" | grep -c .)  window=${WINDOW_ACTIVE:0:1} since=${SINCE:-(oldest)} until=${UNTIL}"
+                log "  hint: narrow the window with --since/--until (or SINCE/UNTIL),"
+                log "        raise MAX_GATHER_BYTES (or --max-size), or free space on the gather volume / --dest-dir"
+                log "  see: prometheus-metadata/size-budget.txt"
+                exit 1
+            fi
+            ;;
+        allow)
+            log "Budget: projected $(awk -v b=${projected} 'BEGIN{printf "%.1f MiB", b/1048576}') <= budget ${budget_display} (policy=${SIZE_POLICY}) - allowed"
+            ;;
+        disabled)
+            log "Budget: disabled (MAX_GATHER_BYTES=none) - no size gate this run"
+            ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # PART -1 - AUTHENTICATION: bind every oc/curl call to the operator's kubeconfig
@@ -230,6 +779,22 @@ oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- df -h "${PROM_DAT
     | tee "${METADATA_DIR}/prometheus-df.txt" >/dev/null \
     || warn "df check failed (continuing)"
 
+# 0f. SOURCE-SIDE PLANNING: block inventory -> window selection -> retention
+#     detect -> size-budget gate. All of this runs BEFORE the admin-API
+#     snapshot probe and BEFORE any byte leaves the pod: a budget miss or an
+#     empty window must abort cheaply, with nothing written to the target.
+log "Planning: block inventory, window selection, retention, size budget"
+BLOCK_INV=$(remote_block_inventory)
+if [[ -z "${BLOCK_INV}" ]]; then
+    fail "block inventory returned no compacted blocks in ${PROM_DATA_DIR} (only WAL/head? - data may be fresh or all in the head yet)"
+fi
+printf '%s\n' "${BLOCK_INV}" > "${METADATA_DIR}/block-inventory.tsv"
+log "Planning: $(grep -c . <<<"${BLOCK_INV}") compacted block(s) on ${PROM_POD}"
+
+select_window "${BLOCK_INV}"
+retention_detect
+size_budget_gate "${BLOCK_INV}"
+
 # ---------------------------------------------------------------------------
 # PART 1 - EXECUTION: obtain a crash-consistent TSDB copy
 #
@@ -277,49 +842,118 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# PART 2 - EXTRACTION into the must-gather output dir
+# PART 2 - SELECTIVE EXTRACTION into the must-gather output dir
 #
-# 'oc cp src:dst' streams a tar over the exec channel - the canonical way to
-# pull a directory from a pod.
+# Only SELECTED paths leave the pod (feature: time-window export). Each item
+# is pulled with the documented exec-pipe form
+#   oc exec ... -- tar cf - -C <remote-root> <item1> <item2> ... | tar xf - -C <local>
+# (plain 'oc cp pod:<subdir>' mangles absolute sub-paths - verified broken
+# 2026-10-02 - while -C + relative member names works in both modes).
 #
-#   MODE=snapshot:  remote <PROM_DATA_DIR>/snapshots/<TS>
-#                   local  ${TSDB_OUT_DIR}/<TS>/{blocks..., wal/...}
-#   MODE=direct:    remote <PROM_DATA_DIR>           (blocks, wal, chunks_head,
-#                   local  ${TSDB_OUT_DIR}/<TS>/{blocks..., wal/...}
-#                   the local dir is named with a UTC timestamp so the layout
-#                   is identical for both modes and the playbook (compose
-#                   SNAPSHOT_DIR) never has to know which mode ran.)
+#   MODE=snapshot:  remote root <PROM_DATA_DIR>/snapshots/<SNAPNAME>
+#   MODE=direct:    remote root <PROM_DATA_DIR>
+#   local:          ${TSDB_OUT_DIR}/<UTC-ts>/{<selected block dirs>,[wal/],[chunks_head/]}
 #
-# queries.active / lock are ephemeral open-state files - excluded in direct
-# mode; the local prometheus recreates them on startup.
+#   - windowless runs: SELECTED_BLOCKS = every block (full export)
+#   - window runs:     only intersecting blocks; excluded blocks never leave
+#   - WAL:             copied only when WAL_INCLUDED=1 (INCLUDE_WAL)
+#   - queries.active / lock / snapshots/ are Ephemeral open-state: the tar
+#     member list never names them (direct mode) - the local prometheus
+#     recreates them on startup.
+# A mid-transfer drop is retried once before failing.
 # ---------------------------------------------------------------------------
 DIRECT_TARGET="${TSDB_OUT_DIR}/$(date -u +%Y%m%dT%H%M%SZ)"
-RCP_SRC="${PROM_POD}:${PROM_DATA_DIR}"
-if [[ "${MODE}" == "snapshot" ]]; then
-    RCP_SRC="${PROM_POD}:${PROM_SNAP_DIR}/${SNAPSHOT_NAME}"
+REMOTE_ROOT="${PROM_DATA_DIR}"
+[[ "${MODE}" == "snapshot" ]] && REMOTE_ROOT="${PROM_SNAP_DIR}/${SNAPSHOT_NAME}"
+
+# member list: selected block dirs + optional head dirs (relative names)
+CP_MEMBERS=""
+for n in ${SELECTED_BLOCKS}; do CP_MEMBERS+="${n} "; done
+if (( WAL_INCLUDED )); then
+    CP_MEMBERS+="wal chunks_head "
+fi
+[[ -n "${CP_MEMBERS}" ]] || fail "nothing selected to extract (selection returned no paths)"
+
+extract_paths() {
+    # $1 = stderr log file; exits 0 on success
+    oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        tar cf - -C "${REMOTE_ROOT}" ${CP_MEMBERS} 2> "$1" | tar xf - -C "${DIRECT_TARGET}"
+}
+
+log "Extracting ${PROM_POD}:${REMOTE_ROOT}[<${CP_MEMBERS}>] -> ${DIRECT_TARGET} (mode=${MODE}, $(tr ' ' '\n' <<<"${CP_MEMBERS}" | grep -c .) path(s))"
+mkdir -p "${DIRECT_TARGET}"
+if ! extract_paths "${OUT_DIR}/oc-cp.stderr"; then
+    log "tar-pipe extraction failed (rc=$?); retrying once"
+    extract_paths "${OUT_DIR}/oc-cp.stderr.retry" \
+        || fail "TSDB extraction failed twice (see ${OUT_DIR}/oc-cp.stderr*)"
+fi
+# drop any open-state artifacts that sneaked into the copy (defensive: the
+# member list already excludes them in direct mode; a snapshot never had them)
+rm -f "${DIRECT_TARGET}/queries.active" "${DIRECT_TARGET}/lock" 2>/dev/null || true
+cp "${OUT_DIR}/oc-cp.stderr" "${METADATA_DIR}/oc-cp.stderr" 2>/dev/null || true
+log "Extraction complete: $(du -sh "${DIRECT_TARGET}" 2>/dev/null | cut -f1) total ($(( $(du -sb -- "${DIRECT_TARGET}" 2>/dev/null | awk '{print $1}') / 1024 / 1024 )) MiB)"
+
+# ---------------------------------------------------------------------------
+# PART 2b - EXPORT GUARDS: enforce the size cap (default 5 GiB) and the
+# optional --at point-in-time filter on the LOCAL copy. See
+# export_tsdb_guard (above) for what is pruned and why the live pod stays
+# untouched in all cases.
+# ---------------------------------------------------------------------------
+log "Applying export guards (cap=${MAX_GB} GiB${AT_SECONDS:+, at=$(date -u -d "@${AT_SECONDS}" +%Y-%m-%dT%H:%M:%SZ)})"
+export_tsdb_guard "${DIRECT_TARGET}"
+log "Export guards done: $(du -sh "${DIRECT_TARGET}" 2>/dev/null | cut -f1) final ($(grep 'blocks_remaining' "${METADATA_DIR}/export-guards.txt" 2>/dev/null | cut -d= -f2) blocks; see ${METADATA_DIR}/export-guards.txt)"
+
+# ---------------------------------------------------------------------------
+# PART 2c - COMPRESSION (feature: measured 2026-10-02, see the feature doc
+# 'Outcomes'). Default zstd -6 = ~74% smaller, ~0.5s on a 1.1GiB TSDB.
+#
+# The extracted tree stays as-is (playback mounts the unpacked dir); the
+# archive is an ADDITIONAL artifact for transfer/storage. Layout:
+#   prometheus-snapshot/<TS>/            <- intact (or pruned) block tree
+#   prometheus-snapshot/<TS>.tar.zst     <- tar | zstd -6 -T0 of that tree
+#   prometheus-snapshot/<TS>.tar.gz      <- (if COMPRESS=gzip)
+#   prometheus-snapshot/SHA256SUMS       <- checksums for EVERY artifact
+# Unpack:  tar -I zstd -xf <TS>.tar.zst -C <newdir>   (or: zstd -d | tar xf -)
+# ---------------------------------------------------------------------------
+COMPRESS_STAT=""
+if [[ "${COMPRESS}" != "none" ]]; then
+    ARCHIVE="${TSDB_OUT_DIR}/$(basename "${DIRECT_TARGET}").tar.${COMPRESS}"
+    log "Compressing extraction: ${DIRECT_TARGET} -> ${ARCHIVE} (${COMPRESS})"
+    COMPRESS_START=$(date +%s)
+    case "${COMPRESS}" in
+        zstd)
+            ( cd "${DIRECT_TARGET}" && tar -cf - . ) | zstd -6 -T0 -q -o "${ARCHIVE}" \
+                || { COMPRESS_STAT="failed"; warn "zstd compression failed - keeping the unarchived tree only"; }
+            ;;
+        gzip)
+            ( cd "${DIRECT_TARGET}" && tar -cf - . ) | gzip -6 -c > "${ARCHIVE}" \
+                || { COMPRESS_STAT="failed"; warn "gzip compression failed - keeping the unarchived tree only"; }
+            ;;
+    esac
+    COMPRESS_END=$(date +%s)
+    if [[ "${COMPRESS_STAT}" != "failed" ]]; then
+        RAW_B=$(du -sb -- "${DIRECT_TARGET}" | awk '{print $1}')
+        ARC_B=$(stat -c %s "${ARCHIVE}")
+        COMPRESS_STAT="$(( COMPRESS_END - COMPRESS_START ))s raw=${RAW_B}B archive=${ARC_B}B ratio=$(awk -v r=${RAW_B} -v a=${ARC_B} 'BEGIN{printf "%.3f", (a>0)? a/r : 0}')"
+        log "Compression done: ${COMPRESS_STAT}"
+    fi
+else
+    COMPRESS_STAT="skipped (COMPRESS=none)"
 fi
 
-log "Extracting ${RCP_SRC} -> ${DIRECT_TARGET} (mode=${MODE})"
-oc cp -n "${MON_NS}" "${RCP_SRC}" "${DIRECT_TARGET}" \
-    --container "${PROM_CONTAINER}" \
-    2> "${OUT_DIR}/oc-cp.stderr"
-RCP_RC=$?   # script runs WITHOUT errexit (set -uo pipefail) so plain capture works
-if [[ ${RCP_RC} -ne 0 ]]; then
-    # retry once - mid-transfer drops are the common cause; the snapshot
-    # (if any) is still on the pod for the retry
-    log "oc cp failed (rc=${RCP_RC}); retrying once"
-    oc cp -n "${MON_NS}" "${RCP_SRC}" "${DIRECT_TARGET}" \
-        --container "${PROM_CONTAINER}" \
-        2> "${OUT_DIR}/oc-cp.stderr.retry" \
-        || fail "oc cp of TSDB failed twice (see ${OUT_DIR}/oc-cp.stderr*)"
+# SHA256SUMS for every shipped artifact (archive + the tree's top entries)
+SUMS_FILE="${TSDB_OUT_DIR}/SHA256SUMS"
+if [[ -f "${ARCHIVE:-}" ]]; then
+    ( cd "${TSDB_OUT_DIR}" && sha256sum "$(basename "${ARCHIVE}")" > "${SUMS_FILE}" )
 fi
-# direct mode: drop open-state artifacts that must not be replayed
-if [[ "${MODE}" == "direct" ]]; then
-    rm -f "${DIRECT_TARGET}/queries.active" "${DIRECT_TARGET}/lock" 2>/dev/null || true
-    log "Removed ephemeral open-state files (queries.active, lock) from the copy"
-fi
-cp "${OUT_DIR}/oc-cp.stderr" "${METADATA_DIR}/oc-cp.stderr" 2>/dev/null || true
-log "Extraction complete: $(du -sh "${DIRECT_TARGET}" 2>/dev/null | cut -f1) total"
+log "Artifacts under ${TSDB_OUT_DIR}: $(ls -1 "${TSDB_OUT_DIR}" | tr '\n' ' ')"
+{
+    echo "compress=${COMPRESS}"
+    echo "status=${COMPRESS_STAT}"
+    [[ -f "${ARCHIVE:-/nonexistent}" ]] && echo "archive=$(basename "${ARCHIVE}")" && sha256sum "${ARCHIVE}" | awk '{print "archive_sha256="$1}'
+    echo "unpack=tar -I zstd -xf <TS>.tar.zst -C <newdir>   (gzip: tar -I gzip -xf ...)"
+    echo "playback=mount the UNPACKED tree / the intact ${DIRECT_TARGET} - see playback/docker-compose.yml"
+} > "${METADATA_DIR}/compression.txt"
 
 # ---------------------------------------------------------------------------
 # PART 3 - FORENSIC METADATA (small context files that make the copied TSDB
@@ -352,11 +986,41 @@ oc get -n "${MON_NS}" pod "${PROM_POD}" -o jsonpath='{range .spec.containers[?(@
 {
     echo "mode=${MODE}"
     echo "prom_port=${PROM_PORT}"
+    echo "max_gb=${MAX_GB}"
+    echo "at_timestamp=${AT_TS:-(none)}"
+    echo "max_size=${MAX_SIZE}"
+    echo "size_policy=${SIZE_POLICY}"
+    echo "compress=${COMPRESS}"
+    echo "window_active=${WINDOW_ACTIVE}"
     echo "snapshot_name=${SNAPSHOT_NAME:-(none)}"
     echo "local_target=${DIRECT_TARGET}"
+    echo "remote_root=${REMOTE_ROOT}"
     [[ "${MODE}" == "direct" ]] \
-        && echo "note=direct copy of live TSDB; local prometheus replays WAL on startup; worst-case loss = torn tail of the newest WAL segment"
+        && echo "note=direct selective copy of the live TSDB; only selected blocks + head dirs were transferred; local prometheus replays the WAL on startup (worst case loss: torn tail of the newest WAL segment)"
 } > "${METADATA_DIR}/extraction-mode.json"
+
+# ---------------------------------------------------------------------------
+# time-window.json (feature contract; written for EVERY run - a windowless
+# run records since=<oldest>/until=now and an empty excluded list)
+# ---------------------------------------------------------------------------
+TW_SINCE=$(date -u -d "@$(( OLDEST_MS / 1000 ))" +%Y-%m-%dT%H:%M:%SZ)
+TW_UNTIL=$(date -u -d "@${UNTIL_SECONDS}" +%Y-%m-%dT%H:%M:%SZ)
+[[ -n "${SINCE}" ]] && TW_SINCE=$(date -u -d "@${SINCE_SECONDS}" +%Y-%m-%dT%H:%M:%SZ)
+{
+    jq -n \
+        --arg since "${TW_SINCE}" \
+        --arg until "${TW_UNTIL}" \
+        --arg wal "${WAL_INCLUDED}" \
+        --arg note "$( [[ "${WINDOW_ACTIVE}" -eq 1 && -n "${EXCLUDED_BLOCKS}" ]] && echo 'Excluded blocks outside window to reduce gather size' || echo 'Full export: no time window requested' )" \
+        --argjson included "$( jq -Rn '[inputs | select(length>0)]' <<<"$(tr ' ' '\n' <<<"${SELECTED_BLOCKS}" | grep . || true)" )" \
+        --argjson excluded "$( jq -Rn '[inputs | select(length>0)]' <<<"$(tr ' ' '\n' <<<"${EXCLUDED_BLOCKS}" | grep . || true)" )" \
+        '{
+            since: $since, until: $until,
+            blocks_included: $included, blocks_excluded: $excluded,
+            include_wal: ($wal == "1"),
+            notes: $note
+        }'
+} > "${METADATA_DIR}/time-window.json"
 
 # INTEGRITY CHECK (in-cluster, using the prom pod's exact promtool).
 # promtool 3.x has NO 'tsdb verify' subcommand (removed); the real, read-only
@@ -391,16 +1055,17 @@ fi
 log "Structural check of local copy ${DIRECT_TARGET}"
 LOCAL_BLOCKS=$(ls -1 "${DIRECT_TARGET}" 2>/dev/null | grep -cE '^[0-9A-Z]{26}$' || true)
 LOCAL_WAL=$( [[ -d "${DIRECT_TARGET}/wal" ]] && echo yes || echo no )
-LOCAL_META_OK=0
+LOCAL_META_OK=1
 for b in ${DIRECT_TARGET}/[0-9A-Z][0-9A-Z][0-9A-Z]*/ ; do
-    [[ -f "${b}meta.json" ]] || { LOCAL_META_OK=1; break; }
+    [[ -f "${b}meta.json" ]] || { LOCAL_META_OK=0; break; }
 done
+[[ ${LOCAL_BLOCKS:-0} -gt 0 ]] || LOCAL_META_OK=0     # empty copy: not ok
 {
     echo "local_blocks=${LOCAL_BLOCKS:-0}"
     echo "local_wal_present=${LOCAL_WAL}"
     echo "local_all_blocks_have_meta.json=${LOCAL_META_OK}"
 } > "${METADATA_DIR}/tsdb-local-struct.txt" 2>&1
-[[ ${LOCAL_META_OK} -eq 0 && ${LOCAL_BLOCKS:-0} -gt 0 ]] \
+[[ ${LOCAL_META_OK} -eq 1 ]] \
     || warn "local copy structural check found a problem (see tsdb-local-struct.txt)"
 
 # ---------------------------------------------------------------------------
@@ -421,4 +1086,4 @@ if [[ "${MODE}" == "snapshot" && -n "${SNAPSHOT_NAME}" ]]; then
 fi
 
 sync   # flush to the rsync sidecar before the framework copies /must-gather
-log "DONE - mode=${MODE}; TSDB in ${DIRECT_TARGET}, metadata in ${METADATA_DIR}"
+log "DONE - mode=${MODE}; TSDB in ${DIRECT_TARGET}; archive=$(basename "${ARCHIVE:-none}"); metadata in ${METADATA_DIR}"

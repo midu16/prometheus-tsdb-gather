@@ -45,11 +45,16 @@ FROM registry.redhat.io/openshift4/ose-must-gather:latest
 # consumes entitlements in-cluster, and the subman packages carry many
 # unfixable CVEs (python3-syspurpose, rhsm-certificates, cloud-what, ...).
 # 'oc', dnf, tar and rsync all keep working after the removal (verified).
+# Also install zstd: gather v1.3.0 defaults to COMPRESS=zstd (measured ~74%
+# TSDB reduction, see features/safeguard-size-selective-export.md Outcomes);
+# the base payload image does NOT ship it (verified: 'zstd: command not
+# found' on ose-must-gather latest).
 RUN dnf -y update \
     && dnf -y remove subscription-manager dnf-plugin-subscription-manager \
            python3-syspurpose python3-cloud-what \
            subscription-manager-rhsm-certificates \
            python3-subscription-manager-rhsm \
+    && dnf -y install zstd \
     && rm -rf /var/cache/dnf /var/cache/yum
 
 # Custom entrypoint: pre-flight -> TSDB snapshot (Prometheus Admin API,
