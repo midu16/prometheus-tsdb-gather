@@ -43,10 +43,13 @@
 #   Outcomes): zstd -6 yields ~74% size reduction in ~0.5s -> the default.
 #   --compress none|zstd|gzip        or   COMPRESS
 #       the extracted copy is archived as
-#         prometheus-snapshot/<TS>.tar.zst   (or .tar.gz) + SHA256SUMS
-#       after extraction (the block tree itself stays intact inside the
-#       pod-side copy step - compression runs locally, CPU-bound, cheap).
-#       Unpack for playback:  tar -I zstd -xf <TS>.tar.zst -C <dir>
+#         prometheus-snapshot/<TS>.tar.zstd   (COMPRESS=zstd)
+#         prometheus-snapshot/<TS>.tar.gz     (COMPRESS=gzip)  + SHA256SUMS
+#       after extraction (the block tree itself stays intact next to the
+#       archive; compression runs locally, CPU-bound, cheap).
+#       NOTE: the suffix is '.tar.' + $COMPRESS, so the zstd archive is named
+#       <TS>.tar.zstd (NOT zstd's default .zst). Unpack for playback:
+#         tar -I zstd -xf <TS>.tar.zstd -C <dir>
 #       (PLAYBACK still mounts the UNPACKED dir; the archive is for
 #       transfer/storage, and both forms verify via SHA256SUMS).
 #
@@ -939,10 +942,12 @@ log "Export guards done: $(du -sh "${DIRECT_TARGET}" 2>/dev/null | cut -f1) fina
 # The extracted tree stays as-is (playback mounts the unpacked dir); the
 # archive is an ADDITIONAL artifact for transfer/storage. Layout:
 #   prometheus-snapshot/<TS>/            <- intact (or pruned) block tree
-#   prometheus-snapshot/<TS>.tar.zst     <- tar | zstd -6 -T0 of that tree
-#   prometheus-snapshot/<TS>.tar.gz      <- (if COMPRESS=gzip)
+#   prometheus-snapshot/<TS>.tar.zstd    <- (COMPRESS=zstd)   tar | zstd -6 -T0
+#   prometheus-snapshot/<TS>.tar.gz      <- (COMPRESS=gzip)
 #   prometheus-snapshot/SHA256SUMS       <- checksums for EVERY artifact
-# Unpack:  tar -I zstd -xf <TS>.tar.zst -C <newdir>   (or: zstd -d | tar xf -)
+# NOTE: the archive suffix is '.tar.' + $COMPRESS, i.e. zstd runs name it
+#       <TS>.tar.zstd (NOT the default zstd extension .zst). Unpack:
+#         tar -I zstd -xf <TS>.tar.zstd -C <newdir>   (or: cat <TS>.tar.zstd | zstd -d | tar xf -)
 # ---------------------------------------------------------------------------
 COMPRESS_STAT=""
 if [[ "${COMPRESS}" != "none" ]]; then
@@ -976,11 +981,22 @@ if [[ -f "${ARCHIVE:-}" ]]; then
     ( cd "${TSDB_OUT_DIR}" && sha256sum "$(basename "${ARCHIVE}")" > "${SUMS_FILE}" )
 fi
 log "Artifacts under ${TSDB_OUT_DIR}: $(ls -1 "${TSDB_OUT_DIR}" | tr '\n' ' ')"
+# build the unpack hint from the ACTUAL archive name (suffix is '.tar.'+
+# $COMPRESS, so zstd is '.tar.zstd', not zstd's default '.zst')
+if [[ -f "${ARCHIVE:-/nonexistent}" ]]; then
+    case "${COMPRESS}" in
+        zstd) UNPACK_CMD="tar -I zstd -xf $(basename "${ARCHIVE}") -C <newdir>" ;;
+        gzip) UNPACK_CMD="tar -I gzip -xf $(basename "${ARCHIVE}") -C <newdir>" ;;
+        *)    UNPACK_CMD="(none - COMPRESS=none, use the unpacked tree directly)" ;;
+    esac
+else
+    UNPACK_CMD="(no archive this run)"
+fi
 {
     echo "compress=${COMPRESS}"
     echo "status=${COMPRESS_STAT}"
     [[ -f "${ARCHIVE:-/nonexistent}" ]] && echo "archive=$(basename "${ARCHIVE}")" && sha256sum "${ARCHIVE}" | awk '{print "archive_sha256="$1}'
-    echo "unpack=tar -I zstd -xf <TS>.tar.zst -C <newdir>   (gzip: tar -I gzip -xf ...)"
+    echo "unpack=${UNPACK_CMD}"
     echo "playback=mount the UNPACKED tree / the intact ${DIRECT_TARGET} - see playback/docker-compose.yml"
 } > "${METADATA_DIR}/compression.txt"
 

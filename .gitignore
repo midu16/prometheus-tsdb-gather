@@ -1,0 +1,16 @@
+# must-gather run outputs (oc adm must-gather / run-must-gather.sh)
+# the framework downloads the payload into --dest-dir; never commit TSDB data,
+# logs, archives, or (potentially large) extracted trees
+demo-run/
+demo-run-*/
+must-gather.local.*/
+must-gather.log
+*.tar.zstd
+*.tar.gz
+
+# gather/podman scratch
+*.orig
+
+# editor / OS noise
+.*.swp
+.DS_Store

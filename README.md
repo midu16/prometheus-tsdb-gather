@@ -165,8 +165,8 @@ The gather script itself (v6, what actually runs on this cluster):
   - wrapper: `SINCE=6h MAX_GATHER_BYTES=1Gi ./run-must-gather.sh <image>`
   - artifacts: `prometheus-metadata/size-budget.txt`, `time-window.json`,
     `retention.txt`, `block-inventory.tsv`; compressed runs also ship
-    `prometheus-snapshot/<TS>.tar.zst` + `SHA256SUMS` (unpack:
-    `tar -I zstd -xf <TS>.tar.zst -C <dir>`)
+    `prometheus-snapshot/<TS>.tar.zstd` + `SHA256SUMS` (unpack:
+    `tar -I zstd -xf <TS>.tar.zstd -C <dir>`)
 - **metadata**: node/pod JSON, `pod describe`, log tail, rendered config (tokens
   redacted), in-cluster `promtool tsdb list` + `analyze` of the newest block
   (promtool 3.x has **no** `tsdb verify`), structural check of the local copy
@@ -215,7 +215,7 @@ du -sh "$P/prometheus-snapshot"
 | gather FATAL `projected must-gather TSDB export exceeds size budget` | v1.3.0 pre-flight budget gate (nothing copied). Narrow `SINCE`/`UNTIL`, raise `MAX_GATHER_BYTES`, or set `SIZE_POLICY=warn`. See `prometheus-metadata/size-budget.txt` |
 | gather FATAL `no TSDB blocks intersect the requested time window` | `SINCE`/`UNTIL` wider than the data on disk (retention deleted older blocks). Check `prometheus-metadata/retention.txt` for effective retention + oldest block time |
 | gather log `zstd compression failed - keeping the unarchived tree only` | image built before the zstd install (Containerfile `dnf -y install zstd`). Rebuild + new tag, or run with `COMPRESS=gzip`/`none` |
-| `prometheus-snapshot/<TS>.tar.zst` present but playback "no data" | the archive is for transfer only: unpack first (`tar -I zstd -xf <TS>.tar.zst -C <dir>`) and point `SNAPSHOT_DIR` at the unpacked tree |
+| `prometheus-snapshot/<TS>.tar.zstd` present but playback "no data" | the archive is for transfer only: unpack first (`tar -I zstd -xf <TS>.tar.zstd -C <dir>`) and point `SNAPSHOT_DIR` at the unpacked tree |
 
 ## Notes & caveats
 
