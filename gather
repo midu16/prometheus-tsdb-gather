@@ -875,17 +875,46 @@ fi
 [[ -n "${CP_MEMBERS}" ]] || fail "nothing selected to extract (selection returned no paths)"
 
 extract_paths() {
-    # $1 = stderr log file; exits 0 on success
+    # $1 = stderr log file (remote+local combined). Return codes:
+    #   0 = clean
+    #   2 = remote tar hit ONLY the expected live-WAL 'file changed as we
+    #       read it' error (the torn-tail loss bound documented in the header -
+    #       the WAL is being appended to while we read it; the copy is still
+    #       crash-consistent and a re-opening prometheus replays what landed)
+    #   1 = any other, real failure (local write error / non-torn-tail remote
+    #       error). Distinguishing matters: a torn-tail is NOT a mid-transfer
+    #       drop, so it must not be "retried" as if the copy were corrupt.
+    local errfile="$1"
     oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
-        tar cf - -C "${REMOTE_ROOT}" ${CP_MEMBERS} 2> "$1" | tar xf - -C "${DIRECT_TARGET}"
+        tar cf - -C "${REMOTE_ROOT}" ${CP_MEMBERS} 2> "${errfile}.remote" \
+        | tar xf - -C "${DIRECT_TARGET}" 2> "${errfile}.local"
+    local rc_remote="${PIPESTATUS[0]}" rc_local="${PIPESTATUS[1]}"
+    cat "${errfile}.remote" "${errfile}.local" > "${errfile}" 2>/dev/null || true
+    # local side: non-zero is always a real problem (cannot write the copy)
+    [[ "${rc_local}" -ne 0 ]] && return 1
+    if [[ "${rc_remote}" -ne 0 ]]; then
+        # strip the benign lines; if nothing of substance remains it's a
+        # torn-tail (return 2), otherwise a genuine error (return 1)
+        local substantive
+        substantive=$(grep -vE 'file changed as we read it|command terminated with exit code' \
+            "${errfile}.remote" 2>/dev/null | grep -v '^[[:space:]]*$' || true)
+        if [[ -z "${substantive}" ]]; then
+            log "WARN: remote tar hit the expected live-WAL torn-tail error (crash-consistent copy; loss <= tail of newest in-flight WAL segment)"
+            return 2
+        fi
+        return 1
+    fi
+    return 0
 }
 
 log "Extracting ${PROM_POD}:${REMOTE_ROOT}[<${CP_MEMBERS}>] -> ${DIRECT_TARGET} (mode=${MODE}, $(tr ' ' '\n' <<<"${CP_MEMBERS}" | grep -c .) path(s))"
 mkdir -p "${DIRECT_TARGET}"
-if ! extract_paths "${OUT_DIR}/oc-cp.stderr"; then
-    log "tar-pipe extraction failed (rc=$?); retrying once"
-    extract_paths "${OUT_DIR}/oc-cp.stderr.retry" \
-        || fail "TSDB extraction failed twice (see ${OUT_DIR}/oc-cp.stderr*)"
+extract_paths "${OUT_DIR}/oc-cp.stderr"; XRC=$?
+if [[ ${XRC} -ne 0 && ${XRC} -ne 2 ]]; then
+    log "tar-pipe extraction failed (rc=${XRC}); retrying once"
+    extract_paths "${OUT_DIR}/oc-cp.stderr.retry"; XRC=$?
+    [[ ${XRC} -ne 0 && ${XRC} -ne 2 ]] \
+        && fail "TSDB extraction failed twice (see ${OUT_DIR}/oc-cp.stderr*)"
 fi
 # drop any open-state artifacts that sneaked into the copy (defensive: the
 # member list already excludes them in direct mode; a snapshot never had them)
