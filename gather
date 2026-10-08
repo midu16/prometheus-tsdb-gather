@@ -10,6 +10,20 @@
 #   3. Writes /must-gather/version (line 1: product, line 2: version)
 #   4. Must NOT leak sensitive data (tokens, certs) into /must-gather
 #
+# SALVAGE MODE (v1.5.0) -- ON BY DEFAULT; --strict-notready /
+# STRICT_NOTREADY=true restores the v1.4.0 pre-flight hard fails.
+#   On SNO the NotReady master-0 used to make the gather ship NOTHING:
+#   checks 0b (node Ready) and 0c (pod Ready) FATAL'd before any byte
+#   was copied. Following the v1.4.0 policy ("always ship the closest
+#   snapshot the cluster can still produce") those gates now default to
+#   loud WARN + continue: a degraded single node still serves 'oc exec'
+#   into a Running container, so the PV-backed TSDB is still readable.
+#   --strict-notready reinstates the hard fail (CI / fresh-export-must
+#   be-clean runs).
+#   PHYSICS NOTE: if the node's kubelet/cri is fully down, oc exec fails
+#   downstream and no data ships - salvage removes the gate, not the
+#   transport.
+#
 # SAFEGUARDS (v1.3.0) -- see features/safeguard-size-selective-export.md
 #
 # Size budget (pre-flight gate, BEFORE any bytes are copied):
@@ -119,6 +133,13 @@ set -uo pipefail
 #     --max-gb <n>         cap in GiB, oldest blocks pruned (env: GATHER_TSDB_MAX_GB, default 5)
 #     --at <ts>            prune blocks starting after <ts> (env: GATHER_TSDB_AT)
 #   -h, --help             print usage
+#   v1.5.0:
+#   --strict-notready      v1.4.0 behavior: FATAL when node '${SNO_NODE}' or the
+#                          prometheus pod is NotReady (pre-flight 0b/0c/0d).
+#                          Default (salvage): those checks downgrade to loud
+#                          WARNs and the gather attempts the extraction anyway;
+#                          the state is recorded in extraction-mode.json.
+#                          (env: STRICT_NOTREADY=true)
 # ---------------------------------------------------------------------------
 usage() {
     cat <<'EOF'
@@ -147,9 +168,12 @@ Compression:
 Legacy post-copy guards (local copy; see v1.2.0 notes):
   --max-gb <n>         cap the exported copy to <n> GiB (default: 5)
                  (env: GATHER_TSDB_MAX_GB)
-  --at <ts>            prune local blocks starting after <ts>
-                 (env: GATHER_TSDB_AT)
-  -h, --help           this help
+   --at <ts>            prune local blocks starting after <ts>
+                  (env: GATHER_TSDB_AT)
+   --strict-notready      require node + prom pod Ready, FATAL otherwise
+                        (default: salvage - NotReady downgrades to WARN)
+                        (env: STRICT_NOTREADY=true)
+   -h, --help           this help
 EOF
 }
 
@@ -159,6 +183,7 @@ SINCE="${SINCE:-}"
 UNTIL="${UNTIL:-now}"
 INCLUDE_WAL="${INCLUDE_WAL:-auto}"
 COMPRESS="${COMPRESS:-zstd}"
+STRICT_NOTREADY="${STRICT_NOTREADY:-}"
 # legacy
 MAX_GB="${GATHER_TSDB_MAX_GB:-5}"
 AT_TS="${GATHER_TSDB_AT:-}"
@@ -173,6 +198,7 @@ while [[ $# -gt 0 ]]; do
         --compress)     COMPRESS="${2:?--compress needs a value}"; shift 2 ;;
         --max-gb)       MAX_GB="${2:?--max-gb needs a value}"; shift 2 ;;
         --at)           AT_TS="${2:?--at needs a value}"; shift 2 ;;
+        --strict-notready) STRICT_NOTREADY="true"; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              echo "gather: unknown flag: $1" >&2; usage >&2; exit 64 ;;
     esac
@@ -214,6 +240,10 @@ case "${COMPRESS}" in
     none|zstd|gzip) : ;;
     *) echo "gather: --compress must be none|zstd|gzip, got: ${COMPRESS}" >&2; exit 64 ;;
 esac
+if [[ -n "${STRICT_NOTREADY}" && "${STRICT_NOTREADY}" != "true" ]]; then
+    echo "gather: STRICT_NOTREADY/--strict-notready must be 'true' if set, got: ${STRICT_NOTREADY}" >&2
+    exit 64
+fi
 case "${INCLUDE_WAL}" in
     true|false|auto) : ;;
     *) echo "gather: --include-wal must be true|false|auto, got: ${INCLUDE_WAL}" >&2; exit 64 ;;
@@ -354,7 +384,7 @@ mkdir -p "${OUT_DIR}" "${TSDB_OUT_DIR}" "${METADATA_DIR}"
 # ---------------------------------------------------------------------------
 {
     echo "prometheus-tsdb-must-gather"
-    echo "1.4.0"
+    echo "1.5.0"
 } > "${OUT_DIR}/version"
 
 # ---------------------------------------------------------------------------
@@ -745,8 +775,13 @@ NODE_JSON=$(oc get node "${SNO_NODE}" -o json 2>&1) \
     echo "$NODE_JSON"
 } > "${METADATA_DIR}/node-${SNO_NODE}.json"
 NODE_PHASE=$(echo "$NODE_JSON" | jq -r '[.status.conditions[]? | select(.type=="Ready")][0].status // "Unknown"')
-[[ "${NODE_PHASE}" == "True" ]] \
-    || fail "node '${SNO_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown})"
+if [[ "${NODE_PHASE}" != "True" ]]; then
+    if [[ "${STRICT_NOTREADY}" == "true" ]]; then
+        fail "node '${SNO_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown}) - strict pre-flight. Drop --strict-notready to attempt a salvage extraction while the node is degraded."
+    else
+        warn "node '${SNO_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown}) - salvage mode (default), continuing. If oc exec to the prom pod stalls, the node's kubelet/cri is down and no data can ship."
+    fi
+fi
 echo "$NODE_JSON" | jq -c '.metadata.labels // {}' > "${METADATA_DIR}/node-${SNO_NODE}-labels.json"
 grep -q 'node-role.kubernetes.io/control-plane' "${METADATA_DIR}/node-${SNO_NODE}-labels.json" \
     || warn "node missing control-plane role label (expected on SNO)"
@@ -760,7 +795,7 @@ PROM_POD=$(oc get pods -n "${MON_NS}" \
         --no-headers -o custom-columns=":metadata.name" 2>/dev/null \
     | grep -x "${PROM_POD}" || true)
 [[ -n "${PROM_POD}" ]] \
-    || fail "pod '${PROM_POD}' not Running in ${MON_NS} (prometheus broken?)"
+    || fail "pod '${PROM_POD}' is not Running in ${MON_NS} - no container to oc exec into; salvage mode cannot read a dead prom container either (the pod must at least be Running - check 'oc get pods -n ${MON_NS}' and the node's kubelet)"
 # NOTE 1: the Ready condition status is the STRING "True" (capital) — grep
 #        must be case-insensitive (a plain 'grep -q true' misses it and
 #        falsely fails: observed 2026-09-29, pod 6/6 Ready -> FATAL).
@@ -774,8 +809,13 @@ for i in $(seq 1 18); do
     [[ ${i} -lt 18 ]] && log "Pod ${PROM_POD} Ready=${ST:-?} - waiting (attempt ${i}/18)"
     sleep 10
 done
-[[ ${READY_OK} -eq 1 ]] \
-    || fail "pod '${PROM_POD}' is Running but not Ready after 180s (last: Ready=${ST:-unknown})"
+if [[ ${READY_OK} -ne 1 ]]; then
+    if [[ "${STRICT_NOTREADY}" == "true" ]]; then
+        fail "pod '${PROM_POD}' is Running but not Ready after 180s (last: Ready=${ST:-unknown}) - strict pre-flight."
+    else
+        warn "pod '${PROM_POD}' is Running but not Ready (last: Ready=${ST:-unknown}) - salvage mode (default), continuing. TSDB reads go through the container runtime; a Running-but-unhealthy prom container is usually still oc-exec-able."
+    fi
+fi
 oc get pod -n "${MON_NS}" "${PROM_POD}" -o json > "${METADATA_DIR}/${PROM_POD}.json"
 
 # 0d. Prometheus HTTP API reachability + web-port detection. OCP managed
@@ -791,8 +831,13 @@ for p in 9090 9091; do
         curl -fsS -m "${ADMIN_TIMEOUT}" "http://127.0.0.1:${p}/api/v1/status/runtimeinfo" 2>/dev/null || true)
     [[ -n "${SNAPLIST}" ]] && { PROM_PORT="${p}"; break; }
 done
-[[ -n "${SNAPLIST}" ]] \
-    || fail "Prometheus HTTP API unreachable on ${PROM_POD} (tried 127.0.0.1:9090 and :9091 from inside the pod)"
+if [[ -z "${SNAPLIST}" ]]; then
+    if [[ "${STRICT_NOTREADY}" == "true" ]]; then
+        fail "Prometheus HTTP API unreachable on ${PROM_POD} (tried 127.0.0.1:9090 and :9091 from inside the pod) - strict pre-flight."
+    fi
+    warn "Prometheus HTTP API unreachable on ${PROM_POD} (tried 127.0.0.1:9090 and :9091 from inside the pod) - salvage mode (default); admin-API snapshot is out, direct TSDB copy is the only path (MODE=direct)"
+    MODE="direct"
+fi
 echo "${SNAPLIST}" > "${METADATA_DIR}/prometheus-runtimeinfo.json"
 PROM_VER=$(echo "${SNAPLIST}" | jq -r '.data.version // empty' 2>/dev/null)
 log "Prometheus HTTP API on 127.0.0.1:${PROM_PORT} inside ${PROM_POD}; version: ${PROM_VER:-unknown}"
@@ -865,11 +910,12 @@ size_budget_gate "${BLOCK_INV}"
 #     -p '{"spec":{"enableFeatures":["delayed-compaction","use-uncached-io","prometheus-admin-api"]}}'
 #   (pod restarts once; PART 1 will then take the snapshot path automatically)
 # ---------------------------------------------------------------------------
-log "Probing Prometheus Admin API on 127.0.0.1:${PROM_PORT} (POST admin/tsdb/snapshot)"
-SNAP_RESP=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
-    curl -sS -m 300 -X POST "http://127.0.0.1:${PROM_PORT}/api/v1/admin/tsdb/snapshot" 2>&1)
-SNAP_RC=$?
-echo "${SNAP_RESP}" > "${METADATA_DIR}/snapshot-probe-response.txt"
+if [[ "${MODE}" == "snapshot" ]]; then
+    log "Probing Prometheus Admin API on 127.0.0.1:${PROM_PORT} (POST admin/tsdb/snapshot)"
+    SNAP_RESP=$(oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        curl -sS -m 300 -X POST "http://127.0.0.1:${PROM_PORT}/api/v1/admin/tsdb/snapshot" 2>&1)
+    SNAP_RC=$?
+    echo "${SNAP_RESP}" > "${METADATA_DIR}/snapshot-probe-response.txt"
 
 if [[ ${SNAP_RC} -eq 0 && "$(echo "${SNAP_RESP}" | jq -r '.status // empty' 2>/dev/null)" == "success" ]]; then
     MODE="snapshot"
@@ -881,6 +927,7 @@ else
     MODE="direct"
     log "Admin API snapshot unavailable (rc=${SNAP_RC}; ${SNAP_RESP:0:120})"
     log "Falling back to MODE=direct: copy the crash-consistent TSDB at ${PROM_DATA_DIR} as-is"
+fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1014,11 +1061,45 @@ else
     COMPRESS_STAT="skipped (COMPRESS=none)"
 fi
 
-# SHA256SUMS for every shipped artifact (archive + the tree's top entries)
+# SHA256SUMS for every shipped artifact: the archive AND the unpacked tree
+# (block dirs relative to <TS>, one line per file). Local-side validators can
+# therefore verify the extracted copy file-by-file with `sha256sum -c` without
+# needing promtool. v1.5.0.
 SUMS_FILE="${TSDB_OUT_DIR}/SHA256SUMS"
+: > "${SUMS_FILE}"
 if [[ -f "${ARCHIVE:-}" ]]; then
-    ( cd "${TSDB_OUT_DIR}" && sha256sum "$(basename "${ARCHIVE}")" > "${SUMS_FILE}" )
+    ( cd "${TSDB_OUT_DIR}" && sha256sum "$(basename "${ARCHIVE}")" >> "${SUMS_FILE}" )
 fi
+# tree entries are rooted at prometheus-snapshot/ so that a single
+# 'sha256sum -c SHA256SUMS' from that dir verifies the archive AND the
+# whole unpacked tree at once (validator contract).
+# NOTE: find -printf '%P' strips the START point (the TS dir), but we need
+# the path relative to prometheus-snapshot/ - so re-prefix the TS dir name
+# with sed after the %P expansion. (Verified pitfall 2026-10-08: without
+# the prefix every line was 'No such file' and the tree was silently
+# dropped from the sums file.)
+TS_NAME="$(basename "${DIRECT_TARGET}")"
+( cd "${TSDB_OUT_DIR}" && find "${TS_NAME}" -type f -printf '%P\n' \
+    | sed "s|^|${TS_NAME}/|" | LC_ALL=C sort | xargs -d '\n' -r sha256sum ) >> "${SUMS_FILE}"
+TSDB_FILE_COUNT=$(wc -l < "${SUMS_FILE}" || echo 0)
+(( TSDB_FILE_COUNT > 1 )) \
+    || warn "SHA256SUMS carries only the archive entry (tree find emitted no file) - integrity check will be archive-only"
+log "SHA256SUMS written: ${TSDB_FILE_COUNT} entries (archive + $( ( cd "${DIRECT_TARGET}" && find . -type f | wc -l ) ) tree files)"
+# per-block manifest (ULID, minTime/maxTime from meta.json, block bytes) so a
+# validator can cross-check the time bounds of what was actually shipped vs the
+# requested window without re-listing remote state
+{
+    echo "block ULID minTime_s maxTime_s bytes"
+    for b in "${DIRECT_TARGET}"/*/; do
+        [[ -d "${b}" && -f "${b}meta.json" ]] || continue
+        n=$(basename "${b}")
+        [[ "${n}" =~ ^[0-9A-Z]{26}$ ]] || continue
+        mt=$(jq -r '.minTime // empty' "${b}meta.json" 2>/dev/null)
+        xt=$(jq -r '.maxTime // empty' "${b}meta.json" 2>/dev/null)
+        sz=$(find "${b}" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}')
+        printf '%s %s %s %s\n' "${n}" "${mt:-0}" "${xt:-0}" "${sz:-0}"
+    done
+} > "${METADATA_DIR}/exported-blocks.tsv"
 log "Artifacts under ${TSDB_OUT_DIR}: $(ls -1 "${TSDB_OUT_DIR}" | tr '\n' ' ')"
 # build the unpack hint from the ACTUAL archive name (suffix is '.tar.'+
 # $COMPRESS, so zstd is '.tar.zstd', not zstd's default '.zst')
@@ -1076,6 +1157,8 @@ oc get -n "${MON_NS}" pod "${PROM_POD}" -o jsonpath='{range .spec.containers[?(@
     echo "size_policy=${SIZE_POLICY}"
     echo "compress=${COMPRESS}"
     echo "window_active=${WINDOW_ACTIVE}"
+    echo "strict_notready=${STRICT_NOTREADY:-false}" \
+      && echo "salvage_mode=$([[ "${STRICT_NOTREADY}" == "true" ]] && echo false || echo true)"
     echo "snapshot_name=${SNAPSHOT_NAME:-(none)}"
     echo "local_target=${DIRECT_TARGET}"
     echo "remote_root=${REMOTE_ROOT}"
@@ -1131,11 +1214,22 @@ if [[ -n "${NEWEST_BLOCK}" ]]; then
     log "Analyzing newest block ${NEWEST_BLOCK} (postings+chunk read probe)"
     # --sandbox-dir-root=/tmp keeps promtool's temp block sandbox OUT of the
     # live ${PROM_DATA_DIR} (the default writes tmp_dbro_sandbox* next to the
-    # TSDB, which would otherwise be copied into the export).
+    # TSDB, which would otherwise be copied into the export). NOT supported by
+    # every promtool build (prom 3.13 payload pod: 'unknown long flag' -
+    # observed 2026-10-08): probe with --help first, drop the flag when absent.
+    analyze_args="\"${PROM_DATA_DIR}\" \"${NEWEST_BLOCK}\""
+    if oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        promtool tsdb analyze --help 2>&1 | grep -q -- '--sandbox-dir-root'; then
+        analyze_args="--sandbox-dir-root=/tmp \"${PROM_DATA_DIR}\" \"${NEWEST_BLOCK}\""
+    else
+        warn "payload promtool lacks --sandbox-dir-root; analyze may leave a tmp_dbro_sandbox* dir in ${PROM_DATA_DIR} (removed below)"
+    fi
     oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
-        promtool tsdb analyze --sandbox-dir-root=/tmp "${PROM_DATA_DIR}" "${NEWEST_BLOCK}" \
+        sh -c "promtool tsdb analyze ${analyze_args}" \
         > "${METADATA_DIR}/tsdb-analyze-newest.txt" 2>&1 \
         || warn "promtool tsdb analyze on ${NEWEST_BLOCK} reported issues (see tsdb-analyze-newest.txt)"
+    oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+        rm -rf "${PROM_DATA_DIR}"/tmp_dbro_sandbox* 2>/dev/null || true
 else
     warn "no compacted block dir found in ${PROM_DATA_DIR} (only WAL? data may be all in head)"
 fi
