@@ -1,0 +1,19 @@
+# =============================================================================
+# Grafana dashboard provisioning
+#
+# Mounted at /etc/grafana/provisioning/dashboards/dashboards.yml.
+# 'options.path' points at the mounted ./dashboards dir; every *.json there
+# is loaded automatically at boot (updateInterval re-scans every 10 min).
+# =============================================================================
+apiVersion: 1
+
+providers:
+  - name: forensic-tsdb
+    orgId: 1
+    folder: SNO Forensics
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,98 @@
+# =============================================================================
+# docker-compose.yml -- local forensic playback of the must-gather TSDB
+#
+# Works with Podman (podman compose) and Docker. No scraping is performed:
+# Prometheus is started purely to READ the extracted TSDB, so every series in
+# Grafana comes from data that actually existed on the SNO prometheus.
+#
+# VOLUME MOUNTING LOGIC (verified on this host, 2026-09-29)
+# ---------------------------------------------------------
+# 'oc adm must-gather' extracts a tree named
+#   <dest-dir>/must-gather.local.<cluster-id>.<ts>.<rand>/quay-io-*/prometheus-snapshot/<TS>/
+# (the gather script controls the inner layout; the outer two dirs are the
+# framework's). That inner <TS> dir is a plain TSDB root:
+#   block-<26-char ULID>/... + chunks_head/ + wal/
+# We mount that exact dir at /prometheus and point --storage.tsdb.path at it;
+# on startup prometheus re-opens the blocks and REPLAYS the WAL (this is what
+# makes a direct copy of a live TSDB safe — see gather, MODE=direct).
+#
+# Two host-specific constraints force the 'user'/'volume' settings below
+# (both reproduced and fixed on this Bazzite host, SELinux Enforcing):
+#   1. SELinux: files under /var/apps carry the 'unlabeled_t' label, which
+#      denies container reads -> mounts must relabel: ':Z' (private) or ':z'.
+#      Plain ':ro' mounts FAIL with EPERM here.
+#   2. Ownership: the extracted snapshot is owned by the host user (midu);
+#      the prometheus image user (nobody) cannot create queries.active ->
+#      the prometheus container must run 'user: "0"'.
+#   (On a non-SELinux host these flags are harmless no-ops.)
+#
+# SNAPSHOT_DIR is overridable so a NEW must-gather run does not require
+# editing this file. Pick the newest snapshot automatically (bash):
+#   MG_DIR=$(ls -dt ./must-gather.local.* | head -1)
+#   SNAPSHOT_DIR=$(find "$MG_DIR" -type d -path '*/prometheus-snapshot/*' | sort | tail -1)
+#   SNAPSHOT_DIR=${SNAPSHOT_DIR%/} podman compose -f playback/docker-compose.yml up -d
+# =============================================================================
+
+services:
+  prometheus:
+    # prom/prometheus upstream, v3.x: same TSDB major as the OCP prometheus
+    # (3.13.2) that produced this data. TSDB format is backward compatible
+    # within the major version, so 3.4 reads the 3.13 blocks fine.
+    image: quay.io/prometheus/prometheus:v3.4.0
+    container_name: fg-prometheus
+    # The snapshot dir on the host is not writable by the image user; running
+    # as root lets prometheus create its queries.active/lock state files in
+    # the mounted dir. Local, admin-bypassable on 127.0.0.1 - fine for forensics.
+    user: "0"
+    ports:
+      # host ${PROM_HOST_PORT} -> container 9090 (the prom web port). This
+      # host already has something listening on 127.0.0.1:9090, so the
+      # default here is 9091; use PROM_HOST_PORT=9090 where 9090 is free.
+      - "127.0.0.1:${PROM_HOST_PORT:-9091}:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      # Mount the extracted TSDB snapshot as Prometheus' storage root.
+      # All blocks found here become queryable on startup, no scraping.
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-admin-api"
+      # Retention: never delete during analysis; unlimited = keep everything
+      - "--storage.tsdb.retention.time=0d"
+    volumes:
+      # The extracted TSDB snapshot (abs path via SNAPSHOT_DIR env var).
+      # ':Z' private SELinux relabel: REQUIRED on this host (see header) -
+      # without it the container cannot read the mounted blocks (EPERM).
+      # ':Z' relabels for THIS container only, so the host file keeps its
+      # original label on next container start.
+      - ${SNAPSHOT_DIR:?set SNAPSHOT_DIR to the extracted .../prometheus-snapshot/<TS> dir}:/prometheus:Z
+      # Minimal empty scrape config (no targets -> zero network activity)
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:Z
+    networks: [fgnet]
+    restart: "no"
+
+  grafana:
+    # explicit docker.io: the implicit 'grafana/grafana-oss' did not resolve
+    # on this host (ghcr.io/quay.io mirrors return 403 here).
+    image: docker.io/grafana/grafana-oss:11.5.1
+    container_name: fg-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # admin / admin (change for anything reachable beyond localhost)
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      # Grafana scans /etc/grafana/provisioning/{datasources,dashboards} at
+      # startup -> datasource + dashboard auto-created, no UI setup.
+      # ':Z' for the same SELinux reason as the prometheus service.
+      - ./datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml:Z
+      - ./dashboards/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:Z
+      - ./dashboards:/var/lib/grafana/dashboards:Z
+    networks: [fgnet]
+    depends_on: [prometheus]
+    restart: "no"
+
+networks:
+  # Single flat bridge: grafana reaches prometheus via the service DNS name
+  # 'prometheus' (datasource.yml url uses it). 'links' semantics equivalent.
+  fgnet:
+    driver: bridge

@@ -14,7 +14,7 @@ Two-stage toolkit:
 ## DEMO
 
 End-to-end recording of a real run on this SNO cluster: the
-`oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:v6` call,
+`rm -rf ./demo-run/; oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:latest --dest-dir $(pwd)/demo-run -- /usr/bin/gather --since 30d --until 29d` call,
 the in-cluster gather (pre-flight → snapshot probe → `MODE=direct` copy of
 the ~1 GB TSDB), the local data-integrity checks, and the compose playback
 querying the extracted historical data.

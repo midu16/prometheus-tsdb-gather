@@ -1,0 +1,18 @@
+# Minimal Prometheus config for LOCAL PLAYBACK ONLY.
+#
+# NO scrape jobs are defined. This instance only exists to open the
+# must-gather TSDB snapshot (mounted read-write at /prometheus via
+# --storage.tsdb.path) and serve queries from it. Keeping scrapers empty
+# guarantees:
+#   * zero network egress from the forensic stack
+#   * no new series polluting the historical dataset
+#   * Grafana sees EXACTLY what the SNO prometheus had recorded
+
+global:
+  # retention is handled by the container flag
+  # --storage.tsdb.retention.time=0d (keep everything)
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Intentionally empty.
+scrape_configs: []
