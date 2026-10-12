@@ -1,0 +1,15 @@
+kind: GlobalDatasource
+metadata:
+  name: prometheus-mustgather
+spec:
+  default: true
+  plugin:
+    kind: PrometheusDatasource
+    spec:
+      # Browser-side directUrl would target the fgnet service name 'prometheus',
+      # which a host browser cannot resolve. Use the HTTPProxy form instead so the
+      # Perses backend proxies queries to the Prometheus container on fgnet.
+      proxy:
+        kind: HTTPProxy
+        spec:
+          url: http://prometheus:9090

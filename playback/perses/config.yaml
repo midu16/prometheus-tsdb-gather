@@ -1,0 +1,17 @@
+database:
+  file:
+    folder: "/etc/perses/provisioning"
+    extension: "yaml"
+# Perses only loads file-based entities when provisioning folders are listed
+# (default: none -> silently skips everything).
+provisioning:
+  folders:
+    - "/etc/perses/provisioning"
+  interval: 10m
+# The persesdev/perses image ships the CUE schemas under /etc/perses/cue/schemas;
+# the binary defaults to `schemas/*` relative to its CWD, so point each path explicitly.
+schemas:
+  panels_path: "/etc/perses/cue/schemas/panels"
+  queries_path: "/etc/perses/cue/schemas/queries"
+  datasources_path: "/etc/perses/cue/schemas/datasources"
+  variables_path: "/etc/perses/cue/schemas/variables"
