@@ -11,16 +11,19 @@
 apiVersion: 1
 
 deleteDatasources:
-  # On redeploy, drop any stale local datasource named 'sno-prom' so the
-  # provisioned one is always authoritative.
+  # On redeploy, drop stale local datasources so the provisioned one is
+  # always authoritative (old name/uid kept for cleanup of older stacks).
   - name: sno-prom
     orgId: 1
+  - name: prometheus-mustgather
+    orgId: 0
 
 datasources:
-  - name: sno-prom
-    # 'Prometheus' type + a stable uid; dashboards reference the uid
-    # ('sno-tsdb') so re-runs keep wired dashboards working.
-    uid: sno-tsdb
+  - name: prometheus-mustgather
+    # Same name as the Perses GlobalDatasource ('prometheus-mustgather'), so
+    # every dashboard in this stack is pinned to one well-known datasource.
+    # Stable uid: dashboards reference the uid so re-runs keep working wired.
+    uid: prometheus-mustgather
     type: prometheus
     access: proxy
     # Service DNS name from docker-compose networks (fgnet). Port 9090 = the

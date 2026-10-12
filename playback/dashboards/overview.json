@@ -1,46 +1,91 @@
 {
   "uid": "sno-forensic-overview",
   "title": "SNO TSDB Forensics - Overview",
-  "tags": ["sno", "forensic", "tsdb"],
+  "tags": [
+    "sno",
+    "forensic",
+    "tsdb"
+  ],
   "timezone": "browser",
   "schemaVersion": 39,
   "version": 1,
   "refresh": "30s",
-  "time": { "from": "now-6h", "to": "now" },
+  "time": {
+    "from": "2026-10-11T12:00:00Z",
+    "to": "2026-10-12T12:00:00Z"
+  },
   "panels": [
     {
       "id": 1,
       "type": "stat",
       "title": "Prometheus Up",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "sno-tsdb" },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-mustgather"
+      },
       "targets": [
         {
           "refId": "A",
-          "expr": "prometheus_tsdb_storage_blocks_total",
+          "expr": "prometheus_tsdb_blocks_loaded",
           "legendFormat": "blocks"
         }
       ],
-      "fieldConfig": { "defaults": {}, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
     },
     {
       "id": 2,
       "type": "stat",
       "title": "Series / Samples",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
-      "datasource": { "type": "prometheus", "uid": "sno-tsdb" },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-mustgather"
+      },
       "targets": [
-        { "refId": "A", "expr": "prometheus_tsdb_head_series", "legendFormat": "head series" },
-        { "refId": "B", "expr": "prometheus_tsdb_head_active_appenders", "legendFormat": "active appenders" }
+        {
+          "refId": "A",
+          "expr": "prometheus_tsdb_head_series",
+          "legendFormat": "head series"
+        },
+        {
+          "refId": "B",
+          "expr": "prometheus_tsdb_head_active_appenders",
+          "legendFormat": "active appenders"
+        }
       ],
-      "fieldConfig": { "defaults": {}, "overrides": [] }
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      }
     },
     {
       "id": 3,
       "type": "timeseries",
       "title": "Node CPU Usage %",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
-      "datasource": { "type": "prometheus", "uid": "sno-tsdb" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-mustgather"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
@@ -61,8 +106,16 @@
       "id": 4,
       "type": "timeseries",
       "title": "Node Memory Used %",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
-      "datasource": { "type": "prometheus", "uid": "sno-tsdb" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-mustgather"
+      },
       "fieldConfig": {
         "defaults": {
           "unit": "percent",
@@ -83,10 +136,22 @@
       "id": 5,
       "type": "timeseries",
       "title": "Node Disk Usage per Mount",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "datasource": { "type": "prometheus", "uid": "sno-tsdb" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-mustgather"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "percent", "max": 100, "min": 0 },
+        "defaults": {
+          "unit": "percent",
+          "max": 100,
+          "min": 0
+        },
         "overrides": []
       },
       "targets": [
@@ -101,15 +166,33 @@
       "id": 6,
       "type": "timeseries",
       "title": "Network Traffic (master-0)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
-      "datasource": { "type": "prometheus", "uid": "sno-tsdb" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-mustgather"
+      },
       "fieldConfig": {
-        "defaults": { "unit": "Bps" },
+        "defaults": {
+          "unit": "Bps"
+        },
         "overrides": []
       },
       "targets": [
-        { "refId": "A", "expr": "sum by (device) (rate(node_network_receive_bytes_total{device!~\"lo|veth.*|kube-.*|cilium_.*\"}[5m]))", "legendFormat": "rx {{device}}" },
-        { "refId": "B", "expr": "sum by (device) (rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|kube-.*|cilium_.*\"}[5m]))", "legendFormat": "tx {{device}}" }
+        {
+          "refId": "A",
+          "expr": "sum by (device) (rate(node_network_receive_bytes_total{device!~\"lo|veth.*|kube-.*|cilium_.*\"}[5m]))",
+          "legendFormat": "rx {{device}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (device) (rate(node_network_transmit_bytes_total{device!~\"lo|veth.*|kube-.*|cilium_.*\"}[5m]))",
+          "legendFormat": "tx {{device}}"
+        }
       ]
     }
   ]

@@ -13,9 +13,10 @@ Works with Podman (`podman compose`) and Docker.
 |-------------------------|---------|
 | `docker-compose.yml`    | Stack definition: `fg-prometheus` + `fg-grafana` on a private bridge network `fgnet`. |
 | `prometheus.yml`        | Minimal Prometheus config, **intentionally empty `scrape_configs`** — zero network egress, no new series polluting the historical dataset. |
-| `datasource.yml`        | Grafana datasource provisioning: auto-creates a default Prometheus datasource `sno-prom` (uid `sno-tsdb`) pointing at `http://prometheus:9090` (service DNS name on `fgnet`). |
+| `datasource.yml`        | Grafana datasource provisioning: auto-creates a default Prometheus datasource `prometheus-mustgather` (uid `prometheus-mustgather` — same name as the Perses GlobalDatasource) pointing at `http://prometheus:9090` (service DNS name on `fgnet`). |
 | `dashboards/dashboards.yml` | Grafana dashboard provisioning: loads every `*.json` in the mounted dashboards dir into the `SNO Forensics` folder, re-scans every 10 min. |
 | `dashboards/overview.json`  | "SNO TSDB Forensics - Overview" dashboard (uid `sno-forensic-overview`): Prometheus Up (block count), Series/Samples (head), Node CPU %, Node Memory %, Node Disk per mount, master-0 Network Traffic. |
+| `perses/`                 | Optional CNCF Perses stack: `config.yaml` (file DB + CUE schema paths + provisioning folder) and `provisioning/datasource.yaml` (GlobalDatasource pointing at Prometheus over the `fgnet` bridge via the HTTPProxy form). |
 
 ## Required environment variable
 
@@ -40,7 +41,10 @@ Pick the newest snapshot automatically (bash):
 
 ```bash
 MG_DIR=$(ls -dt ./must-gather.local.* | head -1)
-SNAPSHOT_DIR=$(find "$MG_DIR" -type d -path '*/prometheus-snapshot/*' | sort | tail -1)
+# The TSDB root is the <TS> dir DIRECTLY under prometheus-snapshot; anything
+# deeper (blocks, chunks) would start prometheus on an empty/invalid TSDB.
+SNAP_PARENT=$(find "$MG_DIR" -type d -name prometheus-snapshot | sort | tail -1)
+SNAPSHOT_DIR=$(ls -dt "$SNAP_PARENT"/*/ | tail -1)
 SNAPSHOT_DIR=${SNAPSHOT_DIR%/} podman compose -f playback/docker-compose.yml up -d
 ```
 
@@ -70,6 +74,7 @@ curl -s 'http://127.0.0.1:9091/api/v1/series?match[]=up' | head -c 300
 |-----------|--------------------------------|----------------|
 | Prometheus UI/API | http://127.0.0.1:9091   | none           |
 | Grafana   | http://127.0.0.1:3000         | admin / admin  |
+| Perses    | http://127.0.0.1:8080         | none (auth disabled) |
 
 - Prometheus host port defaults to **9091** because 9090 was occupied on the
   reference host. Override with `PROM_HOST_PORT=9090` when 9090 is free.
