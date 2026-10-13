@@ -1,0 +1,101 @@
+# Provisioned dashboard: proves perses end-to-end consumption of the
+# replayed must-gather TSDB (perses -> HTTPProxy -> prometheus:9090 -> TSDB).
+# All series shown come from data recorded on the SNO prometheus, not from
+# any live scraping (see prometheus.yml: scrape_configs is empty).
+# Panels use the provisioned default GlobalDatasource
+# (globaldatasources/prometheus-mustgather.yaml), so no per-panel datasource
+# pinning is needed.
+#
+# TIME WINDOW TRAP (historical data!): the TSDB data ends at the snapshot
+# time (2026-10-12 ~13:12 UTC for this gather). Instant queries at "now"
+# return EMPTY. In the WebUI, set the time picker to the gather window
+# (e.g. 2026-10-12 11:00 -> 13:15 UTC) before expecting chart data.
+# (Grafana has the same behavior - pick the historical range there too.)
+#
+# Known cosmetic: persesdev/perses v0.51.0 logs
+# "unable to load every entity ... cannot extract Dashboard, spec cannot be
+# empty" at boot; dashboards are nonetheless loaded through the file-DB
+# layer (verified: they show up in /api/v1/dashboards and render in the UI).
+kind: Dashboard
+metadata:
+  name: sno-tsdb-overview
+  display_name: SNO TSDB Overview (must-gather replay)
+  project: default
+spec:
+  description: >-
+    Forensic playback of the SNO prometheus must-gather TSDB. Data source is
+    the 'prometheus-mustgather' GlobalDatasource (Perses HTTPProxy ->
+    http://prometheus:9090, the local prometheus replaying the snapshot).
+  plugin:
+    kind: PanelGroup
+    spec:
+      display_mode: list
+      panels:
+        - kind: ChartPanel
+          metadata: {}
+          spec:
+            display: {kind: SingleStatChart, spec: []}
+            title: Scrape targets up
+            plugin:
+              kind: TimeSeriesChart
+              spec:
+                data_charts:
+                  - datasource:
+                      kind: DefaultGlobalDatasource
+                    metrics:
+                      kind: PrometheusDatasource
+                      spec:
+                        expr: up
+                        name: up
+                        legend: "{{job}} {{instance}}"
+        - kind: ChartPanel
+          metadata: {}
+          spec:
+            display: {kind: SingleStatChart, spec: []}
+            title: Blocks loaded from snapshot (prometheus_tsdb_storage_blocks_total)
+            plugin:
+              kind: TimeSeriesChart
+              spec:
+                data_charts:
+                  - datasource:
+                      kind: DefaultGlobalDatasource
+                    metrics:
+                      kind: PrometheusDatasource
+                      spec:
+                        expr: prometheus_tsdb_storage_blocks_total
+                        name: blocks
+                        legend: "{{quantile}}"
+        - kind: ChartPanel
+          metadata: {}
+          spec:
+            display: {kind: SingleStatChart, spec: []}
+            title: Head series in TSDB
+            plugin:
+              kind: TimeSeriesChart
+              spec:
+                data_charts:
+                  - datasource:
+                      kind: DefaultGlobalDatasource
+                    metrics:
+                      kind: PrometheusDatasource
+                      spec:
+                        expr: prometheus_tsdb_head_series
+                        name: head_series
+                        legend: ""
+        - kind: ChartPanel
+          metadata: {}
+          spec:
+            display: {kind: SingleStatChart, spec: []}
+            title: Queries served by replayed prometheus
+            plugin:
+              kind: TimeSeriesChart
+              spec:
+                data_charts:
+                  - datasource:
+                      kind: DefaultGlobalDatasource
+                    metrics:
+                      kind: PrometheusDatasource
+                      spec:
+                        expr: sum(rate(prometheus_engine_queries_total[5m]))
+                        name: qps
+                        legend: ""

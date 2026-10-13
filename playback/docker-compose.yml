@@ -69,8 +69,26 @@ services:
     restart: "no"
 
   perses:
-    # Official CNCF Perses dashboard container image
-    image: docker.io/persesdev/perses:v0.49.0
+    # Perses server: API + file DB + embedded React WebUI in one process.
+    #
+    # Local reconstruction of the SNO cluster's Perses components. On the
+    # cluster they are SPLIT:
+    #   * registry.redhat.io/cluster-observability-operator/perses-rhel9
+    #     (@sha256:fc30467a, Perses v0.54.0)          -> API/file-DB ONLY, ships
+    #     no React app (its bare image serves the placeholder index)
+    #   * registry.redhat.io/cluster-observability-operator/
+    #     monitoring-console-plugin-rhel9 (@sha256:7c29531e)
+    #     -> the React WebUI, served ONLY inside the OpenShift console
+    #     (ConsolePlugin 'monitoring-console-plugin', proxy alias 'perses'
+    #     -> perses:8080). That bundle has no standalone entrypoint (no
+    #     index.html; it bootstraps only inside the console host), so it is
+    #     not runnable here.
+    # => We use the upstream persesdev image, which bundles BOTH components
+    #    (same perses-go API + the Perses React build) in a single self
+    #    -contained container. v0.51.0 is the newest copy already in the
+    #    local podman cache (no docker.io pull) and is verified to boot with
+    #    this config + provisioning layout (2026-10-13).
+    image: docker.io/persesdev/perses:v0.51.0
     container_name: fg-perses
     # Image default is USER nobody; the file-based DB writes into the mounted
     # provisioning folder (host-owned), which nobody cannot write. Container

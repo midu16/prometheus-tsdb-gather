@@ -1,3 +1,6 @@
+# NOTE: this file is rewritten by the perses file-DB on every provisioning
+# pass (metadata/createdAt/version get synced). Manual edits outside name
+# +spec.proxy.url survive only until the next pass.
 kind: GlobalDatasource
 metadata:
   name: prometheus-mustgather

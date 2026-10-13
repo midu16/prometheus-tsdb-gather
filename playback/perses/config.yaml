@@ -8,10 +8,7 @@ provisioning:
   folders:
     - "/etc/perses/provisioning"
   interval: 10m
-# The persesdev/perses image ships the CUE schemas under /etc/perses/cue/schemas;
-# the binary defaults to `schemas/*` relative to its CWD, so point each path explicitly.
-schemas:
-  panels_path: "/etc/perses/cue/schemas/panels"
-  queries_path: "/etc/perses/cue/schemas/queries"
-  datasources_path: "/etc/perses/cue/schemas/datasources"
-  variables_path: "/etc/perses/cue/schemas/variables"
+# No `schemas:` section: deprecated since v0.4x and the persesdev/perses
+# image no longer ships /etc/perses/cue/schemas (validated against v0.51.0:
+# pointing at that path makes dashboard provisioning fail with
+# "cannot extract Dashboard, unmarshalling error: spec cannot be empty").
