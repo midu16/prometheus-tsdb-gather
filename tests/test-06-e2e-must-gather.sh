@@ -53,10 +53,17 @@ mkdir -p "${DEST_ROOT}"
 
 # --- assertions over one case's downloaded payload ---------------------------
 # PDIR = the payload dir (contains gather.log/version/prometheus-snapshot)
+# no payload downloaded - distinguish "cluster API vanished mid-run" from a
+# real payload/image problem (observed: 'no route to host' from the VPN path
+# kills both the download AND subsequent cases until the link is back)
 have_payload() {
     PDIR="$(find "${1}" -name gather.log -type f 2>/dev/null | head -1 | xargs -r dirname)"
     if [[ -z "${PDIR:-}" || ! -f "${PDIR}/gather.log" ]]; then
-        fail "no payload gather.log under ${1} (image pull failure? see ${1}/must-gather.logs and ${1}/framework.log)"
+        if grep -q "no route to host\|connection refused" "${1}/framework.log" 2>/dev/null; then
+            fail "cluster API unreachable from this workstation mid-run ('no route to host' in framework.log) - VPN/link down, NOT a payload defect; re-run once connectivity is back"
+        else
+            fail "no payload gather.log under ${1} (image pull failure? see ${1}/must-gather.logs and ${1}/framework.log)"
+        fi
         return 1
     fi
     return 0
@@ -253,12 +260,11 @@ fi
 section "case 07: budget miss + default policy=fail (pre-copy FATAL, nothing ships)"
 run_optional 07 e2e-07-budget-fail --max-size 1MB --limit 0
 if (( RAN )) && have_payload "${CDIR}"; then
-    if [[ ${FRAMEWORK_RC} -ne 0 ]]; then
-        pass "framework rc=${FRAMEWORK_RC} (non-zero: budget refusal propagated)"
-    else
-        fail "framework rc=0 although the budget gate must refuse (policy=fail)"
-    fi
-    grep -q "exceeds size budget" "${PDIR}/gather.log" && pass "FATAL budget line present" || fail "no 'exceeds size budget' line"
+    # NOTE: the framework (oc 5.0.0-rc.2) returns rc=0 even when the payload
+    # exits non-zero - it only requires its own copy phase to succeed. The
+    # CONTRACT we control and assert is the payload side: FATAL recorded,
+    # budget denied, and NOTHING shipped before the refusal.
+    grep -q "exceeds size budget" "${PDIR}/gather.log" && pass "FATAL budget line present (payload exited the pre-flight gate)" || fail "no 'exceeds size budget' line"
     check_field prometheus-metadata/size-budget.txt "decision=deny"
     NBLOCKS=$(find "${PDIR}/prometheus-snapshot" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | grep -cE '/[0-9A-Z]{26}$' || true)
     [[ ${NBLOCKS:-0} -eq 0 ]] && pass "no blocks shipped on a refused run" || fail "${NBLOCKS} block(s) shipped despite the refusal"
