@@ -38,6 +38,21 @@
 #   writes prometheus-metadata/size-budget.txt, then exits non-zero
 #   (policy=fail) without copying anything.
 #
+# Dynamic size cap (v1.6.0) -- DURING the extraction (complements the
+# pre-flight budget above, which decides BEFORE any byte leaves the pod):
+#   --limit <size>   or   GATHER_LIMIT    (default: 4GB; 0 = unlimited)
+#       While the TSDB is copied OUT of the pod, the destination dir size
+#       is monitored CONTINUOUSLY (polled every GATHER_LIMIT_POLL second,
+#       default 1) plus a pre-transfer check per member. Once the exported
+#       data REACHES OR EXCEEDS the cap, the extraction is halted
+#       IMMEDIATELY: the transfer pipeline is killed, the partially-written
+#       member is dropped, a forensic note is written
+#       (prometheus-metadata/limit-halt.txt) and the script exits CLEANLY
+#       (exit 0 - the must-gather pod finishes and ships what already
+#       landed; no container crash). Works together with --since/--until
+#       (unchanged); is independent of the --max-size pre-flight budget
+#       and the legacy --max-gb post-copy prune.
+#
 # Time-window export (selective, source-side: only selected paths leave the
 #   prometheus pod; block granularity = complete ULID dirs, never split):
 #   --since <ts>   or   SINCE     e.g. 2026-09-29T10:00:00Z, 6h, 2d,
@@ -122,6 +137,13 @@ set -uo pipefail
 #     --max-size <size>    bytes, or N{K,M,G,T}{i,B} (default: 2Gi; none=off)
 #                          (env: MAX_GATHER_BYTES)
 #     --size-policy fail|warn   (env: SIZE_POLICY, default fail)
+#   Dynamic size cap (continuous, DURING the extraction):
+#     --limit <size>    cap the exported TSDB while it is copied: bytes or
+#                       N{K,M,G,T}{i,B}; 0 = unlimited (env: GATHER_LIMIT;
+#                       default 4GB). On breach the extraction halts and the
+#                       script exits cleanly (0): what already landed is
+#                       kept + shipped, the partial in-flight member is
+#                       dropped, see prometheus-metadata/limit-halt.txt
 #   Time-window export:
 #     --since <ts>         RFC3339 / "6h" / "2d" / "24 hours ago" / epoch (env: SINCE)
 #     --until <ts>         same, default now                    (env: UNTIL)
@@ -150,6 +172,18 @@ Size safeguard (pre-flight, before any copy):
   --size-policy fail|warn
                        fail = abort with FATAL before the copy (default)
                        warn = log loudly and continue    (env: SIZE_POLICY)
+Dynamic size cap (DURING the extraction; the destination dir is monitored
+continuously while the TSDB is being copied out):
+   --limit <size>       cap the exported TSDB: bytes, or N[K|M|G|T][iB]
+                        [default: 4GB, 0: unlimited]  (env: GATHER_LIMIT)
+                        when the in-flight export reaches the cap the
+                        extraction is HALTED and the script exits cleanly
+                        (exit 0 - no container crash): already-exported
+                        blocks are kept + shipped, the partial in-flight
+                        member is dropped, and the halt is recorded in
+                        prometheus-metadata/limit-halt.txt. Works together
+                        with --since/--until; independent of --max-size
+                        (pre-flight budget) and --max-gb (post-copy prune).
 Time-window export (selective, block-granular, source-side):
    --since <ts>         inclusive lower bound (env: SINCE)
    --until <ts>         inclusive upper bound, default now (env: UNTIL)
@@ -179,6 +213,8 @@ EOF
 
 MAX_SIZE="${MAX_GATHER_BYTES:-2Gi}"
 SIZE_POLICY="${SIZE_POLICY:-fail}"
+LIMIT="${GATHER_LIMIT:-4GB}"
+GATHER_LIMIT_POLL="${GATHER_LIMIT_POLL:-1}"
 SINCE="${SINCE:-}"
 UNTIL="${UNTIL:-now}"
 INCLUDE_WAL="${INCLUDE_WAL:-auto}"
@@ -188,16 +224,22 @@ STRICT_NOTREADY="${STRICT_NOTREADY:-}"
 MAX_GB="${GATHER_TSDB_MAX_GB:-5}"
 AT_TS="${GATHER_TSDB_AT:-}"
 
+# NOTE: missing values are checked EXPLICITLY (exit 64, same contract as
+# every other parse error). The old '${2:?msg}' form aborts non-interactive
+# shells with code 1 instead (bash behavior), and a helper invoked through
+# command substitution would only exit the SUBSHELL.
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --max-size)     MAX_SIZE="${2:?--max-size needs a value}"; shift 2 ;;
-        --size-policy)  SIZE_POLICY="${2:?--size-policy needs a value}"; shift 2 ;;
-        --since)        SINCE="${2:?--since needs a value}"; shift 2 ;;
-        --until)        UNTIL="${2:?--until needs a value}"; shift 2 ;;
-        --include-wal)  INCLUDE_WAL="${2:?--include-wal needs a value}"; shift 2 ;;
-        --compress)     COMPRESS="${2:?--compress needs a value}"; shift 2 ;;
-        --max-gb)       MAX_GB="${2:?--max-gb needs a value}"; shift 2 ;;
-        --at)           AT_TS="${2:?--at needs a value}"; shift 2 ;;
+        --max-size)     [[ $# -ge 2 ]] || { echo "gather: --max-size needs a value" >&2; exit 64; }; MAX_SIZE="$2"; shift 2 ;;
+        --size-policy)  [[ $# -ge 2 ]] || { echo "gather: --size-policy needs a value" >&2; exit 64; }; SIZE_POLICY="$2"; shift 2 ;;
+        --limit)        [[ $# -ge 2 ]] || { echo "gather: --limit needs a value" >&2; exit 64; }; LIMIT="$2"; shift 2 ;;
+        --since)        [[ $# -ge 2 ]] || { echo "gather: --since needs a value" >&2; exit 64; }; SINCE="$2"; shift 2 ;;
+        --until)        [[ $# -ge 2 ]] || { echo "gather: --until needs a value" >&2; exit 64; }; UNTIL="$2"; shift 2 ;;
+        --include-wal)  [[ $# -ge 2 ]] || { echo "gather: --include-wal needs a value" >&2; exit 64; }; INCLUDE_WAL="$2"; shift 2 ;;
+        --compress)     [[ $# -ge 2 ]] || { echo "gather: --compress needs a value" >&2; exit 64; }; COMPRESS="$2"; shift 2 ;;
+        --max-gb)       [[ $# -ge 2 ]] || { echo "gather: --max-gb needs a value" >&2; exit 64; }; MAX_GB="$2"; shift 2 ;;
+        --at)           [[ $# -ge 2 ]] || { echo "gather: --at needs a value" >&2; exit 64; }; AT_TS="$2"; shift 2 ;;
         --strict-notready) STRICT_NOTREADY="true"; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              echo "gather: unknown flag: $1" >&2; usage >&2; exit 64 ;;
@@ -208,18 +250,25 @@ done
 # flag validation + parsing (all hard errors up front, exit 64)
 # ---------------------------------------------------------------------------
 human_size_to_bytes() {
-    # 512, 512K, 512Mi, 2G, none... -> integer bytes; echoes none for none|""
+    # 512, 512K, 512Mi, 2G, 4GB, 500MB, 1234GB, none... -> integer bytes;
+    # echoes none for none|""|off|unlimited|disabled. Units are
+    # case-insensitive; a trailing 'B' is accepted anywhere (Kb, KB, KiB,
+    # GB, MB, GiB, ...).
     local s="$1"
-    [[ -z "${s}" || "${s,,}" == "none" || "${s,,}" == "off" || "${s,,}" == "disabled" ]] \
+    [[ -z "${s}" || "${s,,}" == "none" || "${s,,}" == "off" || "${s,,}" == "unlimited" || "${s,,}" == "disabled" ]] \
         && { echo none; return; }
     [[ "${s}" =~ ^([0-9]+)([A-Za-z]*)$ ]] || { echo ""; return; }
     local num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    # normalize: strip a trailing 'B' (KB/KB/KiB -> K/Ki), uppercase the rest
+    unit="${unit%B}"
+    unit="${unit%b}"
+    unit="${unit^^}"
     case "${unit}" in
-        ""|"B"|"b")                 echo $(( num )) ;;
-        "K"|"k"|"Kb"|"kb"|"Ki"|"ki")          echo $(( num * 1024 )) ;;
-        "M"|"m"|"Mb"|"mb"|"Mi"|"mi")          echo $(( num * 1024 * 1024 )) ;;
-        "G"|"g"|"Gb"|"gb"|"Gi"|"gi")          echo $(( num * 1024 * 1024 * 1024 )) ;;
-        "T"|"t"|"Tb"|"tb"|"Ti"|"ti")          echo $(( num * 1024 * 1024 * 1024 * 1024 )) ;;
+        ""|"I")                     echo $(( num )) ;;
+        "K"|"KI")                   echo $(( num * 1024 )) ;;
+        "M"|"MI")                   echo $(( num * 1024 * 1024 )) ;;
+        "G"|"GI")                   echo $(( num * 1024 * 1024 * 1024 )) ;;
+        "T"|"TI")                   echo $(( num * 1024 * 1024 * 1024 * 1024 )) ;;
         *) echo "" ;;
     esac
 }
@@ -231,6 +280,21 @@ elif [[ -z "${MAX_BYTES}" ]]; then
     echo "gather: cannot parse --max-size '${MAX_SIZE}' (bytes or N[K|M|G|T][iB], or 'none')" >&2
     exit 64
 fi
+
+LIMIT_BYTES="$(human_size_to_bytes "${LIMIT}")"
+if [[ "${LIMIT_BYTES}" == "none" ]]; then
+    LIMIT_BYTES=""                  # unlimited (explicit --limit none/off/unlimited)
+elif [[ -z "${LIMIT_BYTES}" ]]; then
+    echo "gather: cannot parse --limit '${LIMIT}' (bytes or N[K|M|G|T][iB], or '0' for unlimited)" >&2
+    exit 64
+fi
+# 0 (= "unlimited" per the flag contract) and empty both disable the cap
+LIMIT_ACTIVE=0
+if [[ -n "${LIMIT_BYTES}" ]] && (( LIMIT_BYTES > 0 )); then
+    LIMIT_ACTIVE=1
+fi
+[[ "${GATHER_LIMIT_POLL}" =~ ^(0[.][1-9][0-9]*|[1-9][0-9]*([.][0-9]+)?)$ ]] \
+    || { echo "gather: GATHER_LIMIT_POLL must be a positive number of seconds, got: ${GATHER_LIMIT_POLL}" >&2; exit 64; }
 
 case "${SIZE_POLICY}" in
     fail|warn) : ;;
@@ -384,7 +448,7 @@ mkdir -p "${OUT_DIR}" "${TSDB_OUT_DIR}" "${METADATA_DIR}"
 # ---------------------------------------------------------------------------
 {
     echo "prometheus-tsdb-must-gather"
-    echo "1.5.0"
+    echo "1.6.0"
 } > "${OUT_DIR}/version"
 
 # ---------------------------------------------------------------------------
@@ -746,14 +810,18 @@ if [[ -f "${KUBECONFIG_FILE}" ]]; then
     # 'oc whoami' prints the username only - never the token.
     # NOTE: NO --timeout flag: the payload's oc 4.15 client rejects it
     # (verified: 'error: unknown flag: --timeout').
-    log "Auth: KUBECONFIG exported: ${KUBECONFIG_FILE} (user: $(oc whoami 2>&1 || echo 'whoami failed'))"
+    # NOTE: bounded with coreutils 'timeout' (NOT '--timeout', which the
+    # payload's oc 4.15 client rejects as unknown flag). An in-cluster whoami
+    # that hangs must not stall the gather until the framework machinery
+    # kills the pod.
+    log "Auth: KUBECONFIG exported: ${KUBECONFIG_FILE} (user: $(timeout 30 oc whoami 2>&1 || echo 'whoami failed (error or 30s timeout)'))"
 else
     # No injected secret -> fall back to the framework-default in-cluster
     # ServiceAccount credential (the must-gather pod runs with a
     # cluster-admin-bound SA - see framework clusterrolebinding). Unset
     # rather than point at a file so 'oc' uses the pod's own token.
     unset KUBECONFIG
-    log "Auth: no kubeconfig at ${KUBECONFIG_FILE} - using in-cluster SA credential (user: $(oc whoami 2>&1 || echo 'whoami failed'))"
+    log "Auth: no kubeconfig at ${KUBECONFIG_FILE} - using in-cluster SA credential (user: $(timeout 30 oc whoami 2>&1 || echo 'whoami failed (error or 30s timeout)'))"
 fi
 
 # ---------------------------------------------------------------------------
@@ -763,8 +831,11 @@ fi
 # 0a. kube API must be reachable with the credentials from PART -1 above.
 #     ('oc whoami' WITHOUT --timeout: unknown flag on the payload's oc 4.15.)
 log "Pre-flight: verifying API server access"
-oc whoami > "${OUT_DIR}/whoami.txt" 2>&1 \
-    || fail "oc whoami failed - gather pod has no cluster access (see whoami.txt)"
+# (timeout 60 = coreutils, NOT oc --timeout which the 4.15 client rejects;
+#  a hung whoami must fail as a clean FATAL, not stall until the framework
+#  kills the pod)
+timeout 60 oc whoami > "${OUT_DIR}/whoami.txt" 2>&1 \
+    || fail "oc whoami failed (or took >60s) - gather pod has no cluster access (see whoami.txt)"
 
 # 0b. SNO node readiness. On a healthy 1-node SNO, master-0 must be Ready and
 #     carry ALL roles (control-plane, master, worker).
@@ -933,11 +1004,18 @@ fi
 # ---------------------------------------------------------------------------
 # PART 2 - SELECTIVE EXTRACTION into the must-gather output dir
 #
-# Only SELECTED paths leave the pod (feature: time-window export). Each item
-# is pulled with the documented exec-pipe form
-#   oc exec ... -- tar cf - -C <remote-root> <item1> <item2> ... | tar xf - -C <local>
+# Only SELECTED paths leave the pod (feature: time-window export). Transfers
+# use the documented exec-pipe form
+#   oc exec ... -- tar cf - -C <remote-root> <member> | tar xf - -C <local>
 # (plain 'oc cp pod:<subdir>' mangles absolute sub-paths - verified broken
 # 2026-10-02 - while -C + relative member names works in both modes).
+#
+# DYNAMIC SIZE CAP (--limit, v1.6.0): when active, EVERY member is pulled in
+# its own tar-pipe under continuous destination-size monitoring; a member is
+# never even STARTED if it would push the export to/past the cap, and a
+# mid-transfer breach kills the pipeline and halts the run cleanly (see
+# monitor_limit / halt_on_limit below). When UNLIMITED (--limit 0) the
+# original single-pipeline export runs unchanged.
 #
 #   MODE=snapshot:  remote root <PROM_DATA_DIR>/snapshots/<SNAPNAME>
 #   MODE=direct:    remote root <PROM_DATA_DIR>
@@ -996,19 +1074,262 @@ extract_paths() {
     return 0
 }
 
-log "Extracting ${PROM_POD}:${REMOTE_ROOT}[<${CP_MEMBERS}>] -> ${DIRECT_TARGET} (mode=${MODE}, $(tr ' ' '\n' <<<"${CP_MEMBERS}" | grep -c .) path(s))"
-mkdir -p "${DIRECT_TARGET}"
-extract_paths "${OUT_DIR}/oc-cp.stderr"; XRC=$?
-if [[ ${XRC} -ne 0 && ${XRC} -ne 2 ]]; then
-    log "tar-pipe extraction failed (rc=${XRC}); retrying once"
-    extract_paths "${OUT_DIR}/oc-cp.stderr.retry"; XRC=$?
-    [[ ${XRC} -ne 0 && ${XRC} -ne 2 ]] \
-        && fail "TSDB extraction failed twice (see ${OUT_DIR}/oc-cp.stderr*)"
+# ---------------------------------------------------------------------------
+# DYNAMIC SIZE CAP (v1.6.0): per-member extraction under a CONTINUOUS
+# destination-size monitor (active only when LIMIT_ACTIVE=1; the unlimited
+# path reuses extract_paths unchanged above).
+#
+#   * pre-transfer  : a member is never STARTED if (bytes already exported
+#                     + the member's inventory size) reaches the cap.
+#   * mid-transfer  : while the tar-pipe runs, the destination dir is polled
+#                     every GATHER_LIMIT_POLL seconds; once the on-disk size
+#                     REACHES OR EXCEEDS the cap, the pipeline is killed, the
+#                     partially-written member is dropped and the script exits
+#                     CLEANLY (exit 0) - halt_on_limit.
+#   * why per-member: a killed mid-transfer tar may leave a PARTIAL block dir
+#     (meta.json without a complete index = an unopenable TSDB). Dropping the
+#     in-flight member guarantees every block on disk is complete + valid.
+# ---------------------------------------------------------------------------
+LIMIT_HALTED=0                  # 1 once the cap was hit
+LIMIT_HALT_AT=""                # member in flight when the cap was hit
+LIMIT_HALT_REASON=""
+COMPLETED_MEMBERS=""
+MEMBER_INFLIGHT=""
+
+# byte size of a local dir (0 on failure)
+local_dir_bytes() {
+    local d="${1:-${DIRECT_TARGET}}" v
+    v=$(du -sb -- "${d}" 2>/dev/null | awk '{print $1}')
+    [[ -n "${v}" ]] && echo "${v}" || echo 0
+}
+
+# pids (one per line) whose /proc cmdline contains the fixed string $1
+proc_match_pids() {
+    local pat="$1" d pid
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        [[ -r "${d}/cmdline" ]] || continue
+        tr '\0' ' ' < "${d}/cmdline" 2>/dev/null | grep -F -- "${pat}" >/dev/null 2>&1 \
+            && echo "${pid}"
+    done
+}
+
+# best-effort SIGTERM to every process matching $1 (never this script itself)
+kill_pat() {
+    local pat="$1" pid
+    for pid in $(proc_match_pids "${pat}"); do
+        [[ "${pid}" == "$$" ]] && continue
+        kill "${pid}" 2>/dev/null || true
+    done
+}
+
+# monitor_limit <bgpid>: watch ${DIRECT_TARGET} while the extraction pipeline
+# (started in the background, pid $1) runs. Returns 0 when the transfer
+# finished first (or the monitor budget is exhausted); on a cap breach it
+# kills the pipeline, sets LIMIT_HALTED and returns 4.
+monitor_limit() {
+    local bgpid="$1" size i
+    # bounded: monitor at most 6h per member (the framework's own timeout is
+    # the ultimate backstop); past the budget warn and continue unmonitored
+    local deadline=$(( $(date +%s) + 21600 ))
+    while :; do
+        kill -0 "${bgpid}" 2>/dev/null || return 0
+        if (( $(date +%s) > deadline )); then
+            warn "size monitor: 6h poll budget exhausted for '${MEMBER_INFLIGHT}' - continuing unmonitored"
+            return 0
+        fi
+        sleep "${GATHER_LIMIT_POLL}"
+        size=$(local_dir_bytes)
+        if (( size >= LIMIT_BYTES )); then
+            LIMIT_HALTED=1
+            LIMIT_HALT_AT="${MEMBER_INFLIGHT}"
+            LIMIT_HALT_REASON="mid-transfer: on-disk size $(( size / 1024 / 1024 )) MiB reached the ${LIMIT} cap while copying member '${MEMBER_INFLIGHT}'"
+            log "LIMIT BREACH: exported TSDB hit the ${LIMIT} cap ($(( size / 1024 / 1024 )) MiB on disk) while copying '${MEMBER_INFLIGHT}' - halting extraction"
+            # stop the transfer: the subshell wrapper first, then the local
+            # 'tar xf' (disk writes stop instantly) and the oc client that
+            # feeds it (killing it also tears down the remote 'tar cf')
+            kill "${bgpid}" 2>/dev/null || true
+            kill_pat "tar xf - -C ${DIRECT_TARGET}"
+            kill_pat "tar cf - -C ${REMOTE_ROOT}"
+            # bounded drain: make sure no writer is left behind before the
+            # halt records the final on-disk size
+            for i in 1 2 3 4 5; do
+                [[ -n "$(proc_match_pids "tar xf - -C ${DIRECT_TARGET}")" ]] || break
+                sleep 1
+            done
+            return 4
+        fi
+    done
+}
+
+# extract_member <name> <errfile>: stream ONE member from the pod into
+# ${DIRECT_TARGET} under the size monitor. Return codes:
+#   0 = clean
+#   2 = remote tar hit ONLY the expected live-WAL 'file changed as we read
+#       it' error (torn tail; the copy is still crash-consistent)
+#   1 = any other, real failure
+#   4 = the size cap was reached mid-transfer (LIMIT_HALTED=1; the pipeline
+#       was already killed; the caller halts via halt_on_limit)
+extract_member() {
+    local member="$1" errfile="$2"
+    local rcfile="${errfile}.rc"
+    # the pipeline runs in a background subshell so the monitor can poll the
+    # destination while it streams; PIPESTATUS is captured into $rcfile.
+    # BOTH INDICES MUST BE READ IN ONE STATEMENT: PIPESTATUS is reset by the
+    # first simple command of the following group, so a two-line group would
+    # expand PIPESTATUS[1] against a 1-element array (set -u: unbound).
+    (
+        oc exec -n "${MON_NS}" "${PROM_POD}" -c "${PROM_CONTAINER}" -- \
+            tar cf - -C "${REMOTE_ROOT}" "${member}" 2> "${errfile}.remote" \
+            | tar xf - -C "${DIRECT_TARGET}" 2> "${errfile}.local"
+        rc_pair="${PIPESTATUS[0]} ${PIPESTATUS[1]}"
+        printf 'remote=%s\nlocal=%s\n' "${rc_pair%% *}" "${rc_pair##* }" > "${rcfile}"
+    ) &
+    local bgpid=$!
+    (( LIMIT_ACTIVE )) && monitor_limit "${bgpid}"
+    wait "${bgpid}" 2>/dev/null
+    if (( LIMIT_HALTED )); then
+        return 4
+    fi
+    local rr rl substantive
+    rr=$(grep '^remote=' "${rcfile}" 2>/dev/null | cut -d= -f2)
+    rl=$(grep '^local='  "${rcfile}" 2>/dev/null | cut -d= -f2)
+    [[ "${rl}" =~ ^[0-9]+$ ]] || rl=1
+    [[ "${rr}" =~ ^[0-9]+$ ]] || rr=1
+    cat "${errfile}.remote" "${errfile}.local" > "${errfile}" 2>/dev/null || true
+    # local side: non-zero is always a real problem (cannot write the copy)
+    [[ "${rl}" -ne 0 ]] && return 1
+    if [[ "${rr}" -ne 0 ]]; then
+        # same torn-tail classification as extract_paths
+        substantive=$(grep -vE 'file changed as we read it|command terminated with exit code' \
+            "${errfile}.remote" 2>/dev/null | grep -v '^[[:space:]]*$' || true)
+        if [[ -z "${substantive}" ]]; then
+            return 2
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# extract_members_limited: pull every selected member one at a time, with the
+# pre-transfer cap check + the continuous monitor. On a breach: halt_on_limit
+# (records the halt, keeps what landed, exits 0 - never returns).
+extract_members_limited() {
+    local m cur est
+    mkdir -p "${DIRECT_TARGET}"
+    for m in ${CP_MEMBERS}; do
+        # pre-transfer: never START a member that would alone push the copy
+        # to/past the cap (the monitor covers the mid-transfer case, e.g. a
+        # WAL bigger than the remaining budget)
+        cur=$(local_dir_bytes)
+        est=${MEMBER_SIZE["${m}"]:-0}
+        if (( cur + est >= LIMIT_BYTES )); then
+            LIMIT_HALTED=1
+            LIMIT_HALT_AT="${m}"
+            LIMIT_HALT_REASON="pre-transfer: member '${m}' (~$(( est / 1024 / 1024 )) MiB) would push the $(( cur / 1024 / 1024 )) MiB already exported to/past the ${LIMIT} cap"
+            halt_on_limit
+        fi
+        MEMBER_INFLIGHT="${m}"
+        log "Copy '${m}' (~$(( est / 1024 / 1024 )) MiB) -> ${DIRECT_TARGET} [cap ${LIMIT}; on disk $(( cur / 1024 / 1024 )) MiB]"
+        extract_member "${m}" "${OUT_DIR}/oc-cp.stderr-${m}"; local ERC=$?
+        if [[ "${ERC}" -eq 4 ]]; then
+            halt_on_limit            # mid-transfer breach (does not return)
+        fi
+        if [[ "${ERC}" -eq 1 ]]; then
+            log "Copy of '${m}' failed (rc=1); retrying once"
+            extract_member "${m}" "${OUT_DIR}/oc-cp.stderr-${m}.retry"; ERC=$?
+            [[ "${ERC}" -ne 0 && "${ERC}" -ne 2 ]] \
+                && fail "TSDB extraction of member '${m}' failed twice (see ${OUT_DIR}/oc-cp.stderr-${m}*)"
+        fi
+        [[ "${ERC}" -eq 2 ]] \
+            && log "WARN: member '${m}' hit the expected live-WAL torn-tail error (crash-consistent copy; loss <= tail of newest in-flight WAL segment)"
+        COMPLETED_MEMBERS+=" ${m}"
+    done
+}
+
+# halt_on_limit: invoked once the cap is reached (pre- or mid-transfer).
+# Cleanly stops the export: drops the partially-written member, records a
+# forensic note, then exits 0 so the must-gather pod FAILs NEITHER the
+# container NOR the run - what already landed is shipped back.
+halt_on_limit() {
+    local size remainder
+    # belt-and-braces: the monitor already killed the pipeline on breach
+    kill_pat "tar xf - -C ${DIRECT_TARGET}"
+    kill_pat "tar cf - -C ${REMOTE_ROOT}"
+    # drop the in-flight member: its files may be only partially written and
+    # a partial BLOCK dir (meta.json without a complete index) makes the whole
+    # copy unopenable - it must not survive the halt
+    if [[ -n "${LIMIT_HALT_AT}" ]]; then
+        log "LIMIT: dropping partially-written member '${LIMIT_HALT_AT}'"
+        rm -rf -- "${DIRECT_TARGET}/${LIMIT_HALT_AT}" 2>/dev/null || true
+    fi
+    size=$(local_dir_bytes)
+    remainder=""
+    for m in ${CP_MEMBERS}; do
+        case " ${COMPLETED_MEMBERS} " in *" ${m} "*) continue ;; esac
+        [[ "${m}" == "${LIMIT_HALT_AT}" ]] && continue
+        remainder+=" ${m}"
+    done
+    {
+        echo "limit=${LIMIT}"
+        echo "limit_bytes=${LIMIT_BYTES:-0}"
+        echo "halt_at_member=${LIMIT_HALT_AT:-(none)}"
+        echo "halt_reason=${LIMIT_HALT_REASON:-(none)}"
+        echo "size_at_halt_bytes=${size}"
+        echo "size_at_halt_human=$(awk -v b="${size}" 'BEGIN{printf "%.1f MiB", b/1048576}')"
+        echo "members_completed=${COMPLETED_MEMBERS# }"
+        echo "member_dropped=partial in-flight: ${LIMIT_HALT_AT:-(none)}"
+        echo "members_skipped=${remainder# }"
+        echo "kept=yes - the copy is TRUNCATED vs the requested selection, but every block on disk is complete and valid"
+        echo "hint=narrow --since/--until, raise --limit, or pass --limit 0 for unlimited"
+        echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "${METADATA_DIR}/limit-halt.txt"
+    log "LIMIT: extraction halted at the ${LIMIT} cap - on disk: $(( size / 1024 / 1024 )) MiB; completed:[${COMPLETED_MEMBERS# }] dropped:[${LIMIT_HALT_AT:-(none)}] skipped:[${remainder# }]"
+    log "LIMIT: exiting cleanly (exit 0 - must-gather ships the partial export in ${DIRECT_TARGET}; see prometheus-metadata/limit-halt.txt)"
+    sync
+    exit 0
+}
+
+# per-member size estimates (from the source-side inventory) for the
+# pre-transfer cap checks - only fetched when the cap is actually active
+declare -A MEMBER_SIZE=()
+if (( LIMIT_ACTIVE )); then
+    while IFS=$'\t' read -r n mt xt sz; do
+        [[ -n "${n}" ]] || continue
+        case " ${SELECTED_BLOCKS} " in *" ${n} "*) MEMBER_SIZE["${n}"]="${sz:-0}" ;; esac
+    done <<< "${BLOCK_INV}"
+    if (( WAL_INCLUDED )); then
+        MEMBER_SIZE["wal"]=$(remote_dir_bytes "wal")
+        MEMBER_SIZE["chunks_head"]=$(remote_dir_bytes "chunks_head")
+    fi
+fi
+
+NP=$(tr ' ' '\n' <<<"${CP_MEMBERS}" | grep -c .)
+if (( LIMIT_ACTIVE )); then
+    log "Extracting ${PROM_POD}:${REMOTE_ROOT} member-by-member -> ${DIRECT_TARGET} (mode=${MODE}, ${NP} path(s); dynamic cap ${LIMIT} active, poll=${GATHER_LIMIT_POLL}s)"
+    extract_members_limited        # on a cap breach this exits 0 (never returns)
+else
+    log "Extracting ${PROM_POD}:${REMOTE_ROOT}[<${CP_MEMBERS}>] -> ${DIRECT_TARGET} (mode=${MODE}, ${NP} path(s); limit=unlimited)"
+    mkdir -p "${DIRECT_TARGET}"
+    extract_paths "${OUT_DIR}/oc-cp.stderr"; XRC=$?
+    if [[ ${XRC} -ne 0 && ${XRC} -ne 2 ]]; then
+        log "tar-pipe extraction failed (rc=${XRC}); retrying once"
+        extract_paths "${OUT_DIR}/oc-cp.stderr.retry"; XRC=$?
+        [[ ${XRC} -ne 0 && ${XRC} -ne 2 ]] \
+            && fail "TSDB extraction failed twice (see ${OUT_DIR}/oc-cp.stderr*)"
+    fi
 fi
 # drop any open-state artifacts that sneaked into the copy (defensive: the
 # member list already excludes them in direct mode; a snapshot never had them)
 rm -f "${DIRECT_TARGET}/queries.active" "${DIRECT_TARGET}/lock" 2>/dev/null || true
-cp "${OUT_DIR}/oc-cp.stderr" "${METADATA_DIR}/oc-cp.stderr" 2>/dev/null || true
+# collect the per-transfer stderr into the metadata (both the single-pipeline
+# and the per-member forms leave oc-cp.stderr* files under ${OUT_DIR})
+: > "${METADATA_DIR}/oc-cp.stderr"
+for e in "${OUT_DIR}"/oc-cp.stderr*; do
+    [[ -f "${e}" ]] || continue
+    [[ "${e}" == *.remote || "${e}" == *.local || "${e}" == *.rc ]] && continue
+    cat "${e}" >> "${METADATA_DIR}/oc-cp.stderr"
+done
 log "Extraction complete: $(du -sh "${DIRECT_TARGET}" 2>/dev/null | cut -f1) total ($(( $(du -sb -- "${DIRECT_TARGET}" 2>/dev/null | awk '{print $1}') / 1024 / 1024 )) MiB)"
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1476,10 @@ oc get -n "${MON_NS}" pod "${PROM_POD}" -o jsonpath='{range .spec.containers[?(@
     echo "at_timestamp=${AT_TS:-(none)}"
     echo "max_size=${MAX_SIZE}"
     echo "size_policy=${SIZE_POLICY}"
+    echo "limit=${LIMIT}"
+    echo "limit_active=$(( LIMIT_ACTIVE ))"
+    echo "limit_bytes=${LIMIT_BYTES:-(unlimited)}"
+    echo "limit_halt=${LIMIT_HALTED}"
     echo "compress=${COMPRESS}"
     echo "window_active=${WINDOW_ACTIVE}"
     echo "strict_notready=${STRICT_NOTREADY:-false}" \

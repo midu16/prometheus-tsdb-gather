@@ -11,6 +11,9 @@ must-gather.log
 # gather/podman scratch
 *.orig
 
+# test suite outputs (E2E must-gather downloads; never commit TSDB data)
+tests/.e2e-out/
+
 # editor / OS noise
 .*.swp
 .DS_Store

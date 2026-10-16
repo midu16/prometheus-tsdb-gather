@@ -91,6 +91,9 @@ NS_GRACE_SECONDS="${NS_GRACE_SECONDS:-120}"   # keep NS after run: sidecar may s
 #     SIZE_POLICY            fail (default) | warn
 #     INCLUDE_WAL            true | false | auto (default auto)
 #     COMPRESS               none | zstd (default) | gzip
+#   v1.6.0:
+#     GATHER_LIMIT           dynamic cap DURING the copy: 4GB (default) /
+#                            500MB / 0 (unlimited)
 #   v1.2.0 legacy:
 #     GATHER_TSDB_AT takes anything GNU date parses; GATHER_TSDB_MAX_GB caps
 #     the exported copy in GiB (default 5).
@@ -102,6 +105,7 @@ MAX_GATHER_BYTES="${MAX_GATHER_BYTES:-}"
 SIZE_POLICY="${SIZE_POLICY:-}"
 INCLUDE_WAL="${INCLUDE_WAL:-}"
 COMPRESS="${COMPRESS:-}"
+GATHER_LIMIT="${GATHER_LIMIT:-}"
 
 # --- prechecks ----------------------------------------------------------------
 [[ -n "${IMAGE}" ]] \
@@ -190,7 +194,8 @@ if [[ "${INJECT}" == "command" ]]; then
     [[ -n "${SIZE_POLICY}" ]]        && BOOTSTRAP+="; export SIZE_POLICY='${SIZE_POLICY}'"
     [[ -n "${INCLUDE_WAL}" ]]        && BOOTSTRAP+="; export INCLUDE_WAL='${INCLUDE_WAL}'"
     [[ -n "${COMPRESS}" ]]           && BOOTSTRAP+="; export COMPRESS='${COMPRESS}'"
-    BOOTSTRAP+="; echo \"[bootstrap] KUBECONFIG=${MOUNT_PATH}/kubeconfig (user: $(oc whoami 2>/dev/null || echo ?)) since='${SINCE}' until='${UNTIL}' max='${MAX_GATHER_BYTES}' policy='${SIZE_POLICY}' wal='${INCLUDE_WAL}' compress='${COMPRESS}' at='${GATHER_TSDB_AT}' max_gi='${GATHER_TSDB_MAX_GB}'\"; exec /usr/bin/gather"
+    [[ -n "${GATHER_LIMIT}" ]]       && BOOTSTRAP+="; export GATHER_LIMIT='${GATHER_LIMIT}'"
+    BOOTSTRAP+="; echo \"[bootstrap] KUBECONFIG=${MOUNT_PATH}/kubeconfig (user: $(oc whoami 2>/dev/null || echo ?)) since='${SINCE}' until='${UNTIL}' max='${MAX_GATHER_BYTES}' policy='${SIZE_POLICY}' wal='${INCLUDE_WAL}' compress='${COMPRESS}' at='${GATHER_TSDB_AT}' max_gi='${GATHER_TSDB_MAX_GB}' limit='${GATHER_LIMIT}'\"; exec /usr/bin/gather"
     MG_ARGS+=( -- "${BOOTSTRAP}" )
     echo ">> injection mode: command (bootstrap fetches secret into ${MOUNT_PATH}/kubeconfig before gather starts)"
 else
