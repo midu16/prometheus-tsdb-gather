@@ -327,8 +327,9 @@ Flags on the wrapper are the supported UX; env vars remain for debugging and ima
 ## Outcomes (measured on this cluster, 2026-10-03)
 
 All four capabilities implemented in gather v1.3.0 and verified end-to-end with
-`oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:v6 --dest-dir …`
-against this SNO cluster (Prometheus 3.13.2, `MODE=direct`).
+`oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:latest --dest-dir …`
+against this SNO cluster (Prometheus 3.13.2, `MODE=direct`); re-verified on
+`v1.6.0`/`:latest` 2026-10-24 (full allow run, `100Mi` deny run, clamped-window run).
 - **Size safeguard** — pre-flight budget gate before any copy. Default budget 2Gi,
   `SIZE_POLICY=fail`. Verified: full ~960 MiB export under 2Gi budget → `allow`;
   same export with `100Mi` budget → `FATAL: projected must-gather TSDB export

@@ -56,12 +56,12 @@ oc create role        must-gather/mg-kubeconfig-reader --verb=get --resource=sec
 oc create rolebinding must-gather/mg-kubeconfig-reader --serviceaccount=must-gather:default --role=must-gather/mg-kubeconfig-reader --overwrite
 
 # 2) RUN (the wrapper wraps steps 1+3+4; blocks until the download completes)
-./gather-image/run-must-gather.sh quay.io/<your-user>/prometheus-tsdb-gather:v6
+./gather-image/run-must-gather.sh quay.io/<your-user>/prometheus-tsdb-gather:latest
 #    ... or, fully manual, the single framework call the wrapper makes
 #    (note 'set -o pipefail': without it a Forbidden on the secret would
 #     silently write an EMPTY kubeconfig and the run would continue broken):
 # oc adm must-gather \
-#     --image quay.io/<your-user>/prometheus-tsdb-gather:v6 \
+#     --image quay.io/<your-user>/prometheus-tsdb-gather:latest \
 #     --source-dir /must-gather \
 #     --timeout 60m \
 #     --run-namespace must-gather \

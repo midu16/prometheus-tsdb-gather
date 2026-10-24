@@ -1,4 +1,4 @@
-# Selective + Size-Safe TSDB Gather (gather v1.4.0)
+# Selective + Size-Safe TSDB Gather (gather v1.6.0)
 
 How to drive the new safeguard / time-window / retention / compression
 features **from the `oc adm must-gather` command itself** — no wrapper needed.
@@ -14,9 +14,21 @@ The exact call you use to run the extract:
 ```bash
 export KUBECONFIG=/var/apps/sno.frntdeu1.pop.starlinkisp.net/workdir/auth/kubeconfig
 oc adm must-gather \
-    --image=quay.io/midu/prometheus-tsdb-gather:v6 \
+    --image=quay.io/midu/prometheus-tsdb-gather:latest \
     --dest-dir $(pwd)/demo-run
 ```
+
+> **Node volume >70% full? Then add `--volume-percentage=95`.** The
+> must-gather framework runs its own disk-usage checker against the gather
+> pod's volume (default allowance 70%). On a busy SNO node the volume can
+> already be >70% full, in which case the framework SIGKILLs the payload a
+> few ms in — `gather` never starts, `oc` still exits 0, and the payload
+> rsyncs out EMPTY with only `[disk usage checker]` lines in the pod log
+> (observed 2026-10-24, node /var at 84%). Raise the allowance:
+>
+> ```bash
+> oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest --dest-dir $(pwd)/demo-run
+> ```
 
 That's the whole story for a **full, size-guarded, compressed** export. The
 flags below are **optional** and, when present, go **after a `--`** — the
@@ -25,7 +37,7 @@ so it lands as the argument list of `/usr/bin/gather` inside the pod:
 
 ```bash
 oc adm must-gather \
-    --image=quay.io/midu/prometheus-tsdb-gather:v6 \
+    --image=quay.io/midu/prometheus-tsdb-gather:latest \
     --dest-dir $(pwd)/demo-run \
     -- /usr/bin/gather <gather-flags>
 ```
@@ -64,6 +76,13 @@ Size safeguard (pre-flight gate, BEFORE any byte is copied):
   --max-size <size>       projected-export budget: bytes, 512Mi, 2Gi, … (default 2Gi; 'none' = off)
   --size-policy fail|warn fail = abort pre-copy with FATAL (default);  warn = log + continue
 
+Dynamic size cap (DURING the extraction, continuous monitor of the destination):
+  --limit <size>          cap the exported TSDB while it is copied
+                          (default 4GB, 0 = unlimited)
+                          on breach the export HALTS cleanly (exit 0):
+                          kept blocks ship, the partial in-flight member is
+                          dropped, recorded in prometheus-metadata/limit-halt.txt
+
 Time-window export (selective, block-granular, source-side):
   --since <ts>            inclusive lower bound (default: oldest block)
   --until <ts>            inclusive upper bound (default: now)
@@ -71,6 +90,17 @@ Time-window export (selective, block-granular, source-side):
 
 Compression (after extraction, CPU-bound, cheap):
   --compress none|zstd|gzip   archive the extracted copy (default: zstd)
+
+Legacy post-copy guards (v1.2.0, applied to the LOCAL copy after extract):
+  --max-gb <n>            cap the exported copy to <n> GiB, oldest blocks pruned (default 5)
+  --at <ts>               prune local blocks starting after <ts>
+
+Salvage mode (v1.5.0, default) vs strict pre-flight:
+  --strict-notready       v1.4.0 behavior: FATAL when the node or the
+                          prometheus pod is NotReady. Default (salvage):
+                          those checks downgrade to loud WARNs and the
+                          extraction is attempted anyway (recorded in
+                          prometheus-metadata/extraction-mode.json)
 
   <ts> = RFC3339 (2026-10-02T20:00:00Z), Prometheus-relative (6h, 2d, 3d12h, 90m),
          anything GNU date parses ("24 hours ago"), unix seconds, or 'now'.
@@ -90,7 +120,7 @@ demo-run/
 ├── must-gather.logs                        # framework (rsync) log
 ├── timestamp
 └── quay-io-midu-prometheus-tsdb-gather-sha256-<digest>/   # payload
-    ├── version                             # "prometheus-tsdb-must-gather" / "1.4.0"
+    ├── version                             # "prometheus-tsdb-must-gather" / "1.6.0"
     ├── gather.log                          # the full in-cluster run log (read FATAL/WARN here)
     ├── whoami.txt
     ├── prometheus-snapshot/
@@ -101,6 +131,7 @@ demo-run/
         ├── size-budget.txt                 # projected vs budget, policy, decision
         ├── time-window.json                # since/until + included/excluded blocks
         ├── retention.txt                   # effective retention + data bounds
+        ├── limit-halt.txt                  # only on a --limit breach: why/how the export halted
         ├── block-inventory.tsv             # per-block ULID, min/max time, size
         ├── compression.txt                 # ratio, sha256, the exact unpack command
         ├── tsdb-verify.txt                 # in-cluster promtool tsdb list
@@ -125,12 +156,12 @@ P=$(find demo-run -maxdepth 1 -type d -name 'quay-io-*prometheus-tsdb-gather*' |
 
 ---
 
-## Recipes (all verified against this cluster, 2026-10-03)
+## Recipes (verified against this cluster — v6 run 2026-10-03, re-verified on `:latest`/v1.6.0 2026-10-24)
 
 ### 1. Full export, size-guarded, compressed (default)
 
 ```bash
-oc adm must-gather --image=quay.io/midu/prometheus-tsdb-gather:v6 --dest-dir $(pwd)/demo-run
+oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest --dest-dir $(pwd)/demo-run
 ```
 
 Observed (cluster TSDB ≈ 940 MiB):
@@ -266,6 +297,7 @@ Verify integrity without a cluster:
 | `WARN: remote tar hit the expected live-WAL torn-tail error` | **Expected, not a failure.** The WAL is appended while read; copy stays crash-consistent, re-opening Prometheus replays it. Loss ≤ torn tail of newest in-flight segment |
 | `oc adm must-gather` exits 0 but `gather.log` has `FATAL` | Framework does **not** propagate the payload exit code. Always grep `gather.log` for `FATAL`/`DONE - mode=` |
 | `prometheus-snapshot/<ts>.tar.zstd` present but playback empty | Archive is transfer-only: unpack first (`tar -I zstd -xf … -C dir`), point the prom mount at the **unpacked** tree |
-| Ran the **old** script (v1.1.0, no size/window metadata) | Node CRI-O cached the tag. Push a **new image** then evict the node cache: `oc debug node/master-0 -- chroot /host crictl rmi quay.io/midu/prometheus-tsdb-gather:v6` |
+| Ran the **old** script (v1.1.0, no size/window metadata) | Node CRI-O cached the tag. Push a **new image** then evict the node cache: `oc debug node/master-0 -- chroot /host crictl rmi quay.io/midu/prometheus-tsdb-gather:latest` |
+| `[disk usage checker] Disk usage exceeds the volume percentage of 70 for mounted directory, terminating…` + payload SIGKILLed, **`oc` exits 0, payload dir EMPTY** | The *framework's* own disk-usage checker on the gather pod volume, not `gather`. Node/pod volume already >70% full when the pod starts. Re-run with a raised allowance: `--volume-percentage=95` (or free node disk). Check `oc get pod` logs loudly — the rsync still carries only `[disk usage checker]` lines |
 | `zstd compression failed - keeping the unarchived tree only` | Pre-`zstd` image. Rebuild (now `dnf -y install zstd`), or `--compress gzip`/`none` |
 | `mode=snapshot` vs `mode=direct` | Direct is the verified path on this cluster (admin API disabled on Prometheus 3.13). Both yield the same crash-consistent tree; direct writes nothing to the pod |
