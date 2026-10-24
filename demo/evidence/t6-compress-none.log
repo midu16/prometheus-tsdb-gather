@@ -1,0 +1,17 @@
+$ oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest \\
+$     --dest-dir $(pwd)/demo-run-noczip -- /usr/bin/gather --since 4h --compress none
+
+P=$(find demo-run-noczip -maxdepth 1 -type d -name "quay-io-*")
+
+$ grep -E "SHA256SUMS written|DONE - mode=" $P/gather.log
+    [gather 15:45:32] SHA256SUMS written: 14 entries (archive + 14 tree files)
+    [gather 15:45:40] DONE - mode=direct; TSDB in /must-gather/prometheus-snapshot/20261024T154520Z; archive=none; metadata in /must-gather/prometheus-metadata
+
+$ sed -n 1,3p $P/prometheus-metadata/compression.txt
+    compress=none
+    status=skipped (COMPRESS=none)
+    unpack=(no archive this run)
+
+$ ls $P/prometheus-snapshot/    # unpacked tree only - NO archive
+20261024T154520Z
+SHA256SUMS

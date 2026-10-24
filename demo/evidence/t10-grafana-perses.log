@@ -1,0 +1,30 @@
+$ curl -s http://127.0.0.1:3000/api/health
+    grafana 11.5.1 - database: ok
+
+\$ curl -s -u admin:admin "http://127.0.0.1:3000/api/search?type=dash-db" | (list provisioned dashboards)
+    Kubernetes / Compute Resources / Cluster
+    Kubernetes / Compute Resources / Namespace (Pods)
+    Kubernetes / Compute Resources / Namespace (Workloads)
+    Kubernetes / Compute Resources / Node (Pods)
+    Kubernetes / Compute Resources / Pod
+    Kubernetes / Compute Resources / Workload
+    Kubernetes / Networking / Cluster
+    Kubernetes / Networking / Namespace (Pods)
+    Kubernetes / Networking / Pod
+    Node Exporter / USE Method / Cluster
+    Node Exporter / USE Method / Node
+    Prometheus / Overview
+    SNO TSDB Forensics - Overview
+    (provisioned from playback/dashboards/ - they now point at the snapshot prometheus)
+
+\$ curl -s -u admin:admin "http://127.0.0.1:3000/api/datasources"
+    datasource prometheus-mustgather: prometheus -> http://prometheus:9090
+
+$ curl -s http://127.0.0.1:8080/api/v1/health
+    perses 0.51.0 - database: True
+
+\$ curl -s "http://127.0.0.1:8080/api/v1/dashboards?limit=50" | (list provisioned dashboards)
+    SNO TSDB Overview (must-gather replay)  (sno-tsdb-overview)
+
+\$ curl -s "http://127.0.0.1:8080/api/v1/globaldatasources"
+    global datasource: prometheus-mustgather

@@ -1,0 +1,33 @@
+# Instant queries anchor at the snapshot timestamp (?time=) because the data set ends at the export time -
+# an unanchored "now" instant query finds nothing outside the 5m staleness lookback.
+
+T_SNAP=$(date -u -d 20261024T15:34:00Z +%s)   # epoch of the export
+
+$ curl -s "http://127.0.0.1:9091/api/v1/label/__name__/values" | python3 -c "..."
+    -> 2740 metric names loaded from the snapshot
+
+$ curl -sG /api/v1/query -d "query=up" -d "time=$T_SNAP" | python3 -c "print up per target"
+    up series: 69
+    up=1  192.168.1.133:6443
+    up=1  192.168.1.133:9637
+    up=1  192.168.1.133:10250
+    up=1  192.168.1.133:10250
+    up=1  192.168.1.133:10250
+    up=1  10.128.0.109:8443
+    up=1  10.128.0.109:17698
+    up=1  10.128.0.56:8443
+    up=1  10.128.0.114:6443
+    up=1  10.128.0.60:8443
+    up=1  10.128.0.120:7443
+    up=1  10.128.0.67:8443
+    up=1  10.128.0.61:9192
+    up=1  10.128.0.62:60000
+    up=1  10.128.0.29:8080
+
+$ curl -sG /api/v1/query -d "query=node_memory_MemAvailable_bytes/1024/1024/1024" -d "time=$T_SNAP"
+     15.82 GiB free on master-0
+
+$ curl -sG /api/v1/query -d "query=topk(3, sum by (namespace, pod)(container_memory_working_set_bytes{pod!=\"\"}))" -d "time=$T_SNAP"
+      5.57 GiB  openshift-kube-apiserver/kube-apiserver-master-0
+      3.74 GiB  openshift-monitoring/prometheus-k8s-0
+      1.11 GiB  openshift-kube-controller-manager/kube-controller-manager-master-0

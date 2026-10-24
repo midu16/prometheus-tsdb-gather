@@ -1,0 +1,18 @@
+$ oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest \\
+$     --dest-dir $(pwd)/demo-run-guard -- /usr/bin/gather --max-size 100Mi
+(framework rc=0 - the framework NEVER propagates the payload exit code)
+
+P=$(find demo-run-guard -maxdepth 1 -type d -name "quay-io-*")
+
+$ grep -A4 "FATAL: projected must-gather TSDB export exceeds size budget" $P/gather.log
+    [gather 15:41:45] FATAL: projected must-gather TSDB export exceeds size budget
+    [gather 15:41:46]   projected=776MiB  budget=100.0 MiB  policy=fail
+    [gather 15:41:46]   mode=snapshot  blocks_selected=4/4  window=0 since=(oldest) until=now
+    [gather 15:41:46]   hint: narrow the window with --since/--until (or SINCE/UNTIL),
+    [gather 15:41:46]         raise MAX_GATHER_BYTES (or --max-size), or free space on the gather volume / --dest-dir
+
+$ grep decision= $P/prometheus-metadata/size-budget.txt
+decision=deny
+
+$ ls $P/prometheus-snapshot/    # EMPTY - the pre-flight gate aborted BEFORE any byte was copied
+(no files: nothing copied)

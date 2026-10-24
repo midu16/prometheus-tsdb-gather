@@ -1,0 +1,19 @@
+$ KUBECONFIG=/var/apps/sno.frntdeu1.pop.starlinkisp.net/workdir/auth/kubeconfig  oc whoami
+system:admin
+
+$ oc get nodes
+NAME       STATUS   ROLES                         AGE   VERSION
+master-0   Ready    control-plane,master,worker   32d   v1.36.5
+
+$ oc get pods -n openshift-monitoring -l prometheus=k8s
+NAME               READY   STATUS    RESTARTS   AGE
+prometheus-k8s-0   6/6     Running   13         20h
+
+$ oc get prometheus -n openshift-monitoring
+NAME   VERSION   DESIRED   READY   RECONCILED   AVAILABLE   AGE
+k8s    3.13.2    1         1       True         True        32d
+
+$ oc debug node/master-0 -- chroot /host df -h /var    # node disk that hosts the gather pod volume
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdc4       186G  153G   34G  83% /var
+

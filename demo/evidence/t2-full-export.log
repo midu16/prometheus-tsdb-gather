@@ -1,0 +1,77 @@
+$ rm -rf ./demo-run/
+
+$ oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest --dest-dir $(pwd)/demo-run
+[must-gather      ] OUT 2026-10-24T15:33:51.013002562Z Using must-gather plug-in image: quay.io/midu/prometheus-tsdb-gather:latest
+[must-gather      ] OUT 2026-10-24T15:33:51.070737842Z namespace/openshift-must-gather-bn7v5 created
+[must-gather      ] OUT 2026-10-24T15:33:51.091462348Z clusterrolebinding.rbac.authorization.k8s.io/must-gather-mq56f created
+[must-gather      ] OUT 2026-10-24T15:33:51.144469452Z pod for plug-in image quay.io/midu/prometheus-tsdb-gather:latest created
+[must-gather-tzjtb] POD 2026-10-24T15:33:52.330428746Z [disk usage checker] Started
+[must-gather-tzjtb] POD 2026-10-24T15:33:52.338982644Z [disk usage checker] Volume usage percentage: current = 82 ; allowed = 95
+[must-gather-tzjtb] POD 2026-10-24T15:33:52.365432939Z [gather 15:33:52] Auth: resolving kubeconfig for all oc/curl calls
+[must-gather-tzjtb] POD 2026-10-24T15:33:52.623298528Z [gather 15:33:52] Auth: no kubeconfig at /etc/must-gather-kubeconfig/kubeconfig - using in-cluster SA credential (user: system:serviceaccount:openshift-must-gather-bn7v5:default)
+[must-gather-tzjtb] POD 2026-10-24T15:33:52.629422661Z [gather 15:33:52] Pre-flight: verifying API server access
+[must-gather-tzjtb] POD 2026-10-24T15:33:52.902027741Z [gather 15:33:52] Pre-flight: checking node 'master-0' readiness
+[must-gather-tzjtb] POD 2026-10-24T15:33:53.359405106Z [gather 15:33:53] Pre-flight: locating prometheus pod 'prometheus-k8s-0' in openshift-monitoring
+[must-gather-tzjtb] POD 2026-10-24T15:33:54.188966670Z [gather 15:33:54] Pre-flight: checking Prometheus HTTP API (port probe 9090/9091)
+[must-gather-tzjtb] POD 2026-10-24T15:33:54.557364114Z [gather 15:33:54] Prometheus HTTP API on 127.0.0.1:9090 inside prometheus-k8s-0; version: unknown
+[must-gather-tzjtb] POD 2026-10-24T15:33:54.568070345Z [gather 15:33:54] Pre-flight: inventorying /prometheus on prometheus-k8s-0
+...(oc blocks ~40s, framework rc=0)...
+
+P=$(find demo-run -maxdepth 1 -type d -name "quay-io-*prometheus-tsdb-gather*" | head -1)
+
+$ cat $P/version
+prometheus-tsdb-must-gather
+1.6.0
+
+$ ls $P/prometheus-snapshot/
+    total 203044
+    drwxr-xr-x. 3 midu midu      4096 24. Okt 17:34 .
+    drwxrwxrwx. 4 midu midu      4096 24. Okt 17:34 ..
+    drwxr-xr-x. 8 midu midu      4096 24. Okt 17:34 20261024T153401Z
+    -rw-r--r--. 1 midu midu 207896164 24. Okt 17:34 20261024T153401Z.tar.zstd
+    -rw-r--r--. 1 midu midu      2624 24. Okt 17:34 SHA256SUMS
+
+$ grep -E "Auth:|Live TSDB|Window:|Budget:|Compression done|DONE - mode=" $P/gather.log
+    [gather 15:33:52] Auth: resolving kubeconfig for all oc/curl calls
+    [gather 15:33:52] Auth: no kubeconfig at /etc/must-gather-kubeconfig/kubeconfig - using in-cluster SA credential (user: system:serviceaccount:openshift-must-gather-bn7v5:default)
+    [gather 15:33:55] Live TSDB size: 844 MiB (direct-mode oc cp budget; the framework caps the pod volume at --volume-percentage)
+    [gather 15:34:00] Window: selected 4 of 4 blocks; selected=[01M5PVBRP5SAA027V8XMND27BP 01M5Q0D5SKFY01QVVBH1SRN8YF 01M5Q0DH7YV134VJNDFBQTE2QD 01M5Q78WCBD4Y6972Z5WE7DN5T ] excluded=[(none)] wal_included=1 clamped=0 effective=[2026-10-23T18:46:50Z .. 2026-10-24T14:00:00Z]
+    [gather 15:34:01] Budget: projected 761.3 MiB <= budget 2Gi (2147483648 bytes) (policy=fail) - allowed
+    [gather 15:34:15] Compression done: 3s raw=798414179B archive=207896164B ratio=0.260
+    [gather 15:34:32] DONE - mode=direct; TSDB in /must-gather/prometheus-snapshot/20261024T153401Z; archive=20261024T153401Z.tar.zstd; metadata in /must-gather/prometheus-metadata
+
+$ cat $P/prometheus-metadata/size-budget.txt | head -3; tail -1
+budget=2Gi
+policy=fail
+mode=snapshot
+note=projection computed from remote block inventory (pre-copy); compression applied AFTER extraction does not change what the gather pod has to hold
+
+$ tail -2 $P/gather.log | head -1   # FATAL check: none
+    FATAL lines:  0
+
+$ (cd $P/prometheus-snapshot && sha256sum -c SHA256SUMS | tail -2; echo "    -> $(sha256sum -c SHA256SUMS 2>/dev/null | grep -c OK) files OK, 0 FAILED")
+    20261024T153401Z/wal/00000011: OK
+    20261024T153401Z/wal/checkpoint.00000008/00000000: OK
+    -> total 23 files OK, 0 failed
+
+\$ grep decision= $P/prometheus-metadata/size-budget.txt
+decision=allow
+
+\$ head -5 $P/prometheus-metadata/time-window.json
+{
+  "since": "2026-10-23T18:46:50Z",
+  "until": "2026-10-24T14:00:00Z",
+  "window_clamped": false,
+  "blocks_included": [
+
+\$ sed -n 1,4p $P/prometheus-metadata/retention.txt
+retention_effective=15d
+retention_source=prometheus CR spec.retention / --storage.tsdb.retention* flag
+data_oldest_block=1792781210s  (2026-10-23T18:46:50Z)
+data_newest_block=1792850400s  (2026-10-24T14:00:00Z)
+
+\$ sed -n 1,4p $P/prometheus-metadata/compression.txt
+compress=zstd
+status=3s raw=798414179B archive=207896164B ratio=0.260
+archive=20261024T153401Z.tar.zstd
+archive_sha256=48d7a793715143d97955009dfcde82bb72384098034fbdabebd42ed669627918

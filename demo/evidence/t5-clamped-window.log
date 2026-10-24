@@ -1,0 +1,29 @@
+$ oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest \\
+$     --dest-dir $(pwd)/demo-run-clamp -- /usr/bin/gather --since 30d --until 29d
+(requested window is 30 days old - retention (15d) already GCd that data)
+
+P=$(find demo-run-clamp -maxdepth 1 -type d -name "quay-io-*")
+
+$ grep -E "WARN: requested window|Window:|DONE - mode=" $P/gather.log
+    [gather 15:42:52] WARN: requested window [30d .. 29d] does not intersect ANY TSDB block on disk
+    [gather 15:42:52] Window: selected 4 of 4 blocks; selected=[01M5PVBRP5SAA027V8XMND27BP 01M5Q0D5SKFY01QVVBH1SRN8YF 01M5Q0DH7YV134VJNDFBQTE2QD 01M5Q78WCBD4Y6972Z5WE7DN5T ] excluded=[(none)] wal_included=0 clamped=1 effective=[2026-10-23T18:46:50Z .. 2026-10-24T14:00:00Z]
+    [gather 15:43:15] DONE - mode=direct; TSDB in /must-gather/prometheus-snapshot/20261024T154253Z; archive=20261024T154253Z.tar.zstd; metadata in /must-gather/prometheus-metadata
+
+$ jq "{window_clamped, original_request, since, until}" $P/prometheus-metadata/time-window.json
+{
+  "window_clamped": true,
+  "original_request": {
+    "since": "2026-09-24T15:42:44Z",
+    "until": "2026-09-25T15:42:44Z"
+  },
+  "since": "2026-10-23T18:46:50Z",
+  "until": "2026-10-24T14:00:00Z"
+}
+
+$ grep window_vs_data= $P/prometheus-metadata/retention.txt
+window_vs_data=request_disjoint_clamped_to_available
+
+$ ls $P/prometheus-snapshot/    # the closest available snapshot WAS exported
+20261024T154253Z
+20261024T154253Z.tar.zstd
+SHA256SUMS

@@ -1,0 +1,18 @@
+P=demo-run/quay-io-midu-prometheus-tsdb-gather-sha256-db557917413cbe285e76a23cdadc97c4ccfdd43ec17d5bab6b4d4a927e9073f9
+
+$ jq "{since, until}" $P/prometheus-metadata/time-window.json     # the exported data window
+    {"since": "2026-10-23T18:46:50Z", "until": "2026-10-24T14:00:00Z"}
+
+$ curl -sG /api/v1/query_range --data-urlencode "query=avg by (instance) (node_memory_MemAvailable_bytes/1024/1024/1024)" \
+$     -d "start=$WS" -d "end=$WE" -d "step=15m"   # 33 samples - exactly the grid the snapshot provides
+    instance master-0: 33 samples
+      2026-10-23 19:01Z   18.09 GiB
+      2026-10-23 19:16Z   21.01 GiB
+      2026-10-23 19:31Z   18.42 GiB
+      2026-10-23 19:46Z   18.22 GiB
+      ...
+      2026-10-24 13:46Z   15.92 GiB   (last sample of the exported window)
+
+$ curl -sG /api/v1/query_range --data-urlencode "query=avg(rate(container_cpu_usage_seconds_total{pod=~"prometheus-k8s.*"}[10m]))" \
+$     -d "start=$WE" -d "end=$(date -u -d "$WE +30 minutes" +%Y-%m-%dT%H:%M:%SZ)" -d "step=5m"   # AFTER the newest block: served from the REPLAYED WAL
+    7 samples returned for a window that exists ONLY in the WAL head (blocks stop at 2026-10-24T14:00:00Z) - WAL replay works

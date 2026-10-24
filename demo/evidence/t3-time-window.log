@@ -1,0 +1,33 @@
+$ oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest \\
+$     --dest-dir $(pwd)/demo-run-since -- /usr/bin/gather --since 4h
+
+P=$(find demo-run-since -maxdepth 1 -type d -name "quay-io-*")
+
+$ grep -E "Window:|Budget:|DONE - mode=" $P/gather.log
+    [gather 15:39:16] Window: selected 2 of 4 blocks; selected=[01M5Q0D5SKFY01QVVBH1SRN8YF 01M5Q78WCBD4Y6972Z5WE7DN5T ] excluded=[01M5PVBRP5SAA027V8XMND27BP 01M5Q0DH7YV134VJNDFBQTE2QD ] wal_included=1 clamped=0 effective=[2026-10-24T11:39:09Z .. 2026-10-24T14:00:00Z]
+    [gather 15:39:18] Budget: projected 565.4 MiB <= budget 2Gi (2147483648 bytes) (policy=fail) - allowed
+    [gather 15:39:42] DONE - mode=direct; TSDB in /must-gather/prometheus-snapshot/20261024T153918Z; archive=20261024T153918Z.tar.zstd; metadata in /must-gather/prometheus-metadata
+
+$ jq "{blocks_included, blocks_excluded, wal: .include_wal}" $P/prometheus-metadata/time-window.json
+{
+  "blocks_included": [
+    "01M5Q0D5SKFY01QVVBH1SRN8YF",
+    "01M5Q78WCBD4Y6972Z5WE7DN5T"
+  ],
+  "blocks_excluded": [
+    "01M5PVBRP5SAA027V8XMND27BP",
+    "01M5Q0DH7YV134VJNDFBQTE2QD"
+  ],
+  "wal": true
+}
+
+$ ls $P/prometheus-snapshot/          # blocks outside the window were never copied
+20261024T153918Z
+20261024T153918Z.tar.zstd
+SHA256SUMS
+
+$ ls $P/prometheus-snapshot/20261024T153918Z/    # shipped block dirs (2 of 4) + wal + chunks_head
+    01M5Q0D5SKFY01QVVBH1SRN8YF
+    01M5Q78WCBD4Y6972Z5WE7DN5T
+    chunks_head
+    wal

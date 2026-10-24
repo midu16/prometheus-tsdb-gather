@@ -1,0 +1,42 @@
+$ rm -rf ./demo-run/
+$ oc adm must-gather --volume-percentage=95 --image=quay.io/midu/prometheus-tsdb-gather:latest --dest-dir $(pwd)/demo-run
+[must-gather      ] OUT 2026-10-24T15:30:53.376500547Z Using must-gather plug-in image: quay.io/midu/prometheus-tsdb-gather:latest
+When opening a support case, bugzilla, or issue please include the following summary data along with any other requested information:
+ClusterID: 464042c9-997a-4655-8e90-ed0e9dcacd1a
+ClientVersion: 5.0.0-rc.2
+ClusterVersion: Stable at "5.0.0-rc.7"
+ClusterOperators:
+	All healthy and stable
+
+
+[must-gather      ] OUT 2026-10-24T15:30:53.43383981Z namespace/openshift-must-gather-9hptn created
+[must-gather      ] OUT 2026-10-24T15:30:53.448796643Z clusterrolebinding.rbac.authorization.k8s.io/must-gather-vn42x created
+[must-gather      ] OUT 2026-10-24T15:30:53.592991717Z pod for plug-in image quay.io/midu/prometheus-tsdb-gather:latest created
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.740433233Z [disk usage checker] Started
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.747765579Z [disk usage checker] Volume usage percentage: current = 83 ; allowed = 70
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.747765579Z [disk usage checker] Disk usage exceeds the volume percentage of 70 for mounted directory, terminating...
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.765128184Z /bin/bash: line 32:     3 Killed                  setsid -w bash  <<-MUSTGATHER_EOF
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.765128184Z /usr/bin/gather
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.765128184Z MUSTGATHER_EOF
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.765128184Z 
+[must-gather-c6j8h] POD 2026-10-24T15:30:54.789750144Z Caches written to disk
+[must-gather-c6j8h] OUT 2026-10-24T15:31:03.643811446Z waiting for gather to complete
+[must-gather-c6j8h] OUT 2026-10-24T15:31:03.656872237Z downloading gather output
+[must-gather-c6j8h] OUT 2026-10-24T15:31:03.80511172Z receiving incremental file list
+[must-gather-c6j8h] OUT 2026-10-24T15:31:03.815250347Z ./
+[must-gather-c6j8h] OUT 2026-10-24T15:31:03.819245071Z 
+[must-gather-c6j8h] OUT 2026-10-24T15:31:03.819264968Z sent 27 bytes  received 45 bytes  144,00 bytes/sec
+[must-gather-c6j8h] OUT 2026-10-24T15:31:03.819268936Z total size is 0  speedup is 0,00
+[must-gather      ] OUT 2026-10-24T15:31:03.84722839Z namespace/openshift-must-gather-9hptn deleted
+
+
+Reprinting Cluster State:
+When opening a support case, bugzilla, or issue please include the following summary data along with any other requested information:
+ClusterID: 464042c9-997a-4655-8e90-ed0e9dcacd1a
+ClientVersion: 5.0.0-rc.2
+ClusterVersion: Stable at "5.0.0-rc.7"
+ClusterOperators:
+	All healthy and stable
+
+
+(framework rc=0)

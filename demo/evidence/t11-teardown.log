@@ -1,0 +1,9 @@
+$ make -C playback down
+    SNAPSHOT_DIR = .../demo-run/quay-io-...-sha256-db5579.../prometheus-snapshot/20261024T153401Z
+    fg-perses
+    fg-prometheus
+    fg-grafana
+    (podman-compose stops + removes all three containers, then removes the pod and network)
+
+$ podman ps --filter name=fg- --format "{{.Names}}"
+    (no output - no fg- containers remain; clean teardown)
