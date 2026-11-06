@@ -24,6 +24,29 @@
 #   downstream and no data ships - salvage removes the gate, not the
 #   transport.
 #
+# NODE DISCOVERY / TOPOLOGY (v1.7.0) -- NO node name is hardcoded anymore.
+#   The old SNO_NODE="master-0" default assumed a single-node cluster and
+#   broke on MNO (multi-node OpenShift: compact 3-node, control-plane +
+#   workers, monitoring moved to infra nodes). The pre-flight now resolves
+#   the target node DYNAMICALLY, valid for SNO and MNO alike:
+#     1. cluster node inventory (ALL nodes: roles from node-role labels +
+#        Ready condition) -> prometheus-metadata/cluster-topology.json,
+#        with a computed cluster_kind: single-node (SNO profile), multi-node
+#        compact, multi-node. Forensics input, not a gate.
+#     2. the Running prometheus pod is located by the dependable selector
+#        'prometheus=k8s' (the pinned name PROM_POD stays first-choice;
+#        a renamed/migrated statefulset ordinal AUTO-DETECTS otherwise)
+#     3. TARGET NODE = that pod's spec.nodeName - wherever the monitoring
+#        stack actually landed. The extraction oc-execs into the POD, so the
+#        pod's node is the only node that matters; placement assumptions are
+#        gone. Pin via --node <name> / SNO_NODE=<name> (a pin that disagrees
+#        with the pod placement is a loud WARN, not an abort).
+#     4. prerequisites are validated LIVE against the resolved node/pod:
+#        node not-found stats, Ready condition (strict/salvage policy as
+#        before), role labels recorded context-aware (no-master-role is
+#        NORMAL when monitoring runs on infra/worker nodes), and a degraded
+#        control plane is a loud WARN + forensics record, not an abort.
+#
 # SAFEGUARDS (v1.3.0) -- see features/safeguard-size-selective-export.md
 #
 # Size budget (pre-flight gate, BEFORE any bytes are copied):
@@ -156,8 +179,10 @@ set -uo pipefail
 #     --at <ts>            prune blocks starting after <ts> (env: GATHER_TSDB_AT)
 #   -h, --help             print usage
 #   v1.5.0:
-#   --strict-notready      v1.4.0 behavior: FATAL when node '${SNO_NODE}' or the
-#                          prometheus pod is NotReady (pre-flight 0b/0c/0d).
+#   --strict-notready      v1.4.0 behavior: FATAL when the target node
+#                          (auto-discovered or pinned via --node/SNO_NODE)
+#                          or the prometheus pod is NotReady
+#                          (pre-flight 0b/0c/0c2/0d).
 #                          Default (salvage): those checks downgrade to loud
 #                          WARNs and the gather attempts the extraction anyway;
 #                          the state is recorded in extraction-mode.json.
@@ -195,6 +220,14 @@ Time-window export (selective, block-granular, source-side):
                        auto: true when until is within 1h of now)
   <ts> = RFC3339 (2026-09-29T10:00:00Z), relative (6h, 2d, 'now'),
        anything GNU date parses, or unix seconds.
+Node selection (SNO / MNO):
+  --node <name>        pin the target node explicitly (env: SNO_NODE).
+                       Default: AUTO-DISCOVER - the target node is the node
+                       hosting the Running prometheus-k8s pod, so it is
+                       valid for any topology (single-node SNO, compact
+                       3-node, control-plane+worker MNO, monitoring on
+                       infra nodes). Full node inventory is shipped as
+                       prometheus-metadata/cluster-topology.json.
 Compression:
   --compress none|zstd|gzip
                        archive the extracted copy (default: zstd -6)
@@ -238,6 +271,7 @@ while [[ $# -gt 0 ]]; do
         --until)        [[ $# -ge 2 ]] || { echo "gather: --until needs a value" >&2; exit 64; }; UNTIL="$2"; shift 2 ;;
         --include-wal)  [[ $# -ge 2 ]] || { echo "gather: --include-wal needs a value" >&2; exit 64; }; INCLUDE_WAL="$2"; shift 2 ;;
         --compress)     [[ $# -ge 2 ]] || { echo "gather: --compress needs a value" >&2; exit 64; }; COMPRESS="$2"; shift 2 ;;
+        --node)         [[ $# -ge 2 ]] || { echo "gather: --node needs a value" >&2; exit 64; }; SNO_NODE="$2"; shift 2 ;;
         --max-gb)       [[ $# -ge 2 ]] || { echo "gather: --max-gb needs a value" >&2; exit 64; }; MAX_GB="$2"; shift 2 ;;
         --at)           [[ $# -ge 2 ]] || { echo "gather: --at needs a value" >&2; exit 64; }; AT_TS="$2"; shift 2 ;;
         --strict-notready) STRICT_NOTREADY="true"; shift ;;
@@ -395,13 +429,24 @@ fi
 # ---------------------------------------------------------------------------
 # Configuration / environment
 # ---------------------------------------------------------------------------
-SNO_NODE="master-0"                       # the single node of this SNO install
+# Target-node selection is DYNAMIC (SNO *and* MNO):
+#   empty value = auto-discover: pre-flight 0c/0c2 resolves the node that
+#   RUNS the prometheus pod (pod.spec.nodeName) - no name may be hardcoded
+#   because MNO topologies place the monitoring stack anywhere.
+#   non-empty  = pin (--node <name> / env SNO_NODE); a pin that disagrees
+#   with the pod's actual placement is a loud WARN, not an abort.
+SNO_NODE="${SNO_NODE:-}"                   # optional pin, empty = auto-discover
 MON_NS="openshift-monitoring"             # namespace hosting Prometheus on OCP
-PROM_POD="${PROM_POD:-prometheus-k8s-0}"  # can be overridden; default = the
-                                           # well-known name of the k8s prometheus
 PROM_CONTAINER="prometheus"               # container name inside the prom pod
 PROM_DATA_DIR="/prometheus"               # prometheus -storage.tsdb.path on-disk
 PROM_SNAP_DIR="${PROM_DATA_DIR}/snapshots"   # Admin API writes <dir>/snapshots/<ts>
+# 0c discovery semantics: an EXPLICIT operator pin (PROM_POD env present) is
+# authoritative - not-found is a clean pre-flight fail; the DEFAULT name is
+# opportunistic (auto-detect by selector when the default is not Running).
+PROM_POD_EXPLICIT=0
+[[ -n "${PROM_POD:-}" ]] && PROM_POD_EXPLICIT=1
+PROM_POD="${PROM_POD:-prometheus-k8s-0}"  # can be overridden; default = the
+                                           # well-known name of the k8s prometheus
 ADMIN_TIMEOUT=10                          # seconds per curl to the Admin API
 OUT_DIR="${MUST_GATHER:-/must-gather}"    # the rsync-able output dir
 TSDB_OUT_DIR="${OUT_DIR}/prometheus-snapshot"
@@ -448,7 +493,7 @@ mkdir -p "${OUT_DIR}" "${TSDB_OUT_DIR}" "${METADATA_DIR}"
 # ---------------------------------------------------------------------------
 {
     echo "prometheus-tsdb-must-gather"
-    echo "1.6.0"
+    echo "1.7.0"
 } > "${OUT_DIR}/version"
 
 # ---------------------------------------------------------------------------
@@ -837,36 +882,85 @@ log "Pre-flight: verifying API server access"
 timeout 60 oc whoami > "${OUT_DIR}/whoami.txt" 2>&1 \
     || fail "oc whoami failed (or took >60s) - gather pod has no cluster access (see whoami.txt)"
 
-# 0b. SNO node readiness. On a healthy 1-node SNO, master-0 must be Ready and
-#     carry ALL roles (control-plane, master, worker).
-log "Pre-flight: checking node '${SNO_NODE}' readiness"
-NODE_JSON=$(oc get node "${SNO_NODE}" -o json 2>&1) \
-    || fail "node '${SNO_NODE}' not found: ${NODE_JSON}"
-{
-    echo "$NODE_JSON"
-} > "${METADATA_DIR}/node-${SNO_NODE}.json"
-NODE_PHASE=$(echo "$NODE_JSON" | jq -r '[.status.conditions[]? | select(.type=="Ready")][0].status // "Unknown"')
-if [[ "${NODE_PHASE}" != "True" ]]; then
-    if [[ "${STRICT_NOTREADY}" == "true" ]]; then
-        fail "node '${SNO_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown}) - strict pre-flight. Drop --strict-notready to attempt a salvage extraction while the node is degraded."
-    else
-        warn "node '${SNO_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown}) - salvage mode (default), continuing. If oc exec to the prom pod stalls, the node's kubelet/cri is down and no data can ship."
-    fi
+# 0b. CLUSTER TOPOLOGY INVENTORY (dynamic, SNO and MNO). EVERY node is
+#     recorded with its roles (node-role labels) and Ready condition into
+#     cluster-topology.json. This replaces the old hardcoded
+#     "SNO_NODE=master-0" assumption: on a multi-node cluster "which nodes
+#     exist and what do they carry" can no longer be assumed - it is queried.
+#     The ACTUAL target node is resolved dynamically in 0c2 (the node running
+#     the prom pod), optionally pinned via --node / SNO_NODE. This inventory
+#     is forensics metadata, not a gate: an extraction is only invalid when
+#     the prom pod itself is unreadable (checked in 0c/0c2 below).
+log "Pre-flight: inventorying cluster nodes (topology discovery)"
+NODES_JSON=$(oc get nodes -o json 2>&1) \
+    || fail "could not list cluster nodes: ${NODES_JSON}"
+echo "$NODES_JSON" > "${METADATA_DIR}/cluster-nodes.json"
+# roles = node-role.kubernetes.io/<role> labels. ltrimstr avoids regex
+# quirks across the base image's jq versions (1.5/1.6 both support it).
+TOPOLOGY=$(echo "$NODES_JSON" | jq -r '
+  .items
+  | map({
+      name: .metadata.name,
+      roles: (.metadata.labels // {}
+              | to_entries | map(.key)
+              | map(select(startswith("node-role.kubernetes.io/")))
+              | map(ltrimstr("node-role.kubernetes.io/")) | sort),
+      ready: ([.status.conditions[]? | select(.type=="Ready")][0].status // "Unknown")
+    })
+  | {
+      node_count: length,
+      control_plane_nodes: (map(select((.roles | index("master") != null)
+                                       or (.roles | index("control-plane") != null)))
+                            | map(.name)),
+      worker_nodes: (map(select(.roles | index("worker") != null)) | map(.name)),
+      not_ready_nodes: (map(select(.ready != "True")) | map(.name)),
+      cluster_kind: (if length == 1 then "single-node (SNO profile)"
+                     elif (map(.roles | index("master") != null) | all)
+                     then "multi-node compact (every node also carries the master role)"
+                     else "multi-node" end),
+      nodes: .
+    }') \
+    || true
+if [[ -n "${TOPOLOGY}" ]] && echo "${TOPOLOGY}" | jq empty >/dev/null 2>&1; then
+    echo "${TOPOLOGY}" > "${METADATA_DIR}/cluster-topology.json"
+    log "Pre-flight: cluster topology: $(echo "${TOPOLOGY}" | jq -r '[.cluster_kind, "cp=\(.control_plane_nodes|length)", "workers=\(.worker_nodes|length)", "total=\(.node_count)", "notReady=\(.not_ready_nodes|length)"] | join(", ")')"
+    # a DEGRADED CONTROL PLANE is not an extraction blocker (the extraction
+    # reads the prom pod, wherever it runs - see 0c/0c2) but it must be loud:
+    CP_READY=$(echo "$NODES_JSON" | jq -r '[.items[] | select(((.metadata.labels // {}) | has("node-role.kubernetes.io/master") or has("node-role.kubernetes.io/control-plane"))) | select(([.status.conditions[]? | select(.type=="Ready")][0].status // "Unknown") == "True")] | length')
+    [[ "${CP_READY}" -ge 1 ]] \
+        || warn "no Ready control-plane node (degraded control plane) - continuing; the extraction reads the prometheus pod, wherever it runs (see cluster-topology.json)"
+else
+    warn "cluster topology summary could not be computed (jq output invalid) - the raw node list is kept in cluster-nodes.json"
 fi
-echo "$NODE_JSON" | jq -c '.metadata.labels // {}' > "${METADATA_DIR}/node-${SNO_NODE}-labels.json"
-grep -q 'node-role.kubernetes.io/control-plane' "${METADATA_DIR}/node-${SNO_NODE}-labels.json" \
-    || warn "node missing control-plane role label (expected on SNO)"
 
-# 0c. prometheus-k8s-0 must exist and be Running+Ready. The field-selector
-#     narrows the watch server-side; we grep the exact pod name because some
-#     upgrades briefly rename/migrate the statefulset ordinal.
-log "Pre-flight: locating prometheus pod '${PROM_POD}' in ${MON_NS}"
-PROM_POD=$(oc get pods -n "${MON_NS}" \
+# 0c. the prometheus pod must exist and be Running+Ready. Discovery order:
+#     1) honor the operator's pin (PROM_POD env, default prometheus-k8s-0);
+#     2) otherwise AUTO-DETECT by the stack's dependable selector
+#        'prometheus=k8s' (any statefulset ordinal/shard; shields against
+#        renamed/migrated ordinals during upgrades). POD first, NODE second:
+#        on MNO the pod may be scheduled on ANY node, so the node follows
+#        the pod (0c2), never the other way round.
+log "Pre-flight: locating the Running prometheus pod in ${MON_NS} (selector 'prometheus=k8s', pin: '${PROM_POD}'${PROM_POD_EXPLICIT:+, EXPLICIT})"
+PROM_POD_CAND=$(oc get pods -n "${MON_NS}" \
         -l prometheus=k8s --field-selector=status.phase==Running \
-        --no-headers -o custom-columns=":metadata.name" 2>/dev/null \
-    | grep -x "${PROM_POD}" || true)
+        --no-headers -o custom-columns=":metadata.name" 2>/dev/null)
+PROM_POD_PINNED="${PROM_POD}"   # remember what the operator (or default) asked for
+if [[ -n "${PROM_POD_CAND}" ]]; then
+    PINNED_RUNNING=$(printf '%s\n' "${PROM_POD_CAND}" | grep -x "${PROM_POD_PINNED}" || true)
+    if [[ -z "${PINNED_RUNNING}" ]]; then
+        if [[ ${PROM_POD_EXPLICIT} -eq 1 ]]; then
+            # an EXPLICIT operator pin is authoritative: not-found is a clean,
+            # PRE-ANY-COPY pre-flight failure (also the offline-test abort)
+            fail "pod '${PROM_POD_PINNED}' (explicit PROM_POD pin) is not Running in ${MON_NS} - check 'oc get pods -n ${MON_NS}' (Running pods with the selector: ${PROM_POD_CAND//()$/  })"
+        fi
+        PROM_POD=$(printf '%s\n' "${PROM_POD_CAND}" | head -1)
+        log "Pre-flight: default name '${PROM_POD_PINNED}' is not the Running pod (renamed/migrated ordinal?) - auto-detected '${PROM_POD}'"
+    fi
+else
+    PROM_POD=""   # the fail message below must not name a pod that is not Running
+fi
 [[ -n "${PROM_POD}" ]] \
-    || fail "pod '${PROM_POD}' is not Running in ${MON_NS} - no container to oc exec into; salvage mode cannot read a dead prom container either (the pod must at least be Running - check 'oc get pods -n ${MON_NS}' and the node's kubelet)"
+    || fail "no Running pod with label prometheus=k8s in ${MON_NS} - no container to oc exec into; salvage mode cannot read a dead prom container either (the pod must at least be Running - check 'oc get pods -n ${MON_NS}' and the node's kubelet)"
 # NOTE 1: the Ready condition status is the STRING "True" (capital) — grep
 #        must be case-insensitive (a plain 'grep -q true' misses it and
 #        falsely fails: observed 2026-09-29, pod 6/6 Ready -> FATAL).
@@ -888,6 +982,56 @@ if [[ ${READY_OK} -ne 1 ]]; then
     fi
 fi
 oc get pod -n "${MON_NS}" "${PROM_POD}" -o json > "${METADATA_DIR}/${PROM_POD}.json"
+
+# 0c2. TARGET NODE RESOLUTION + verification (dynamic; SNO and MNO alike).
+#      The extraction oc-execs into the prom container, so the node that
+#      matters is the one RUNNING the pod (spec.nodeName) - wherever the
+#      monitoring stack actually landed (control plane on SNO/compact,
+#      anything on MNO). --node/SNO_NODE may pin a node explicitly; a pin
+#      that disagrees with the pod placement is a loud WARN, not an abort
+#      (the operator may want a different node's forensics on purpose).
+if [[ -n "${SNO_NODE}" ]]; then
+    TARGET_NODE="${SNO_NODE}"
+    POD_NODE=$(jq -r '.spec.nodeName // ""' "${METADATA_DIR}/${PROM_POD}.json" 2>/dev/null)
+    log "Pre-flight: target node PINNED via --node/SNO_NODE: '${TARGET_NODE}' (prom pod runs on: '${POD_NODE:-unknown}')"
+    if [[ -n "${POD_NODE}" && "${POD_NODE}" != "${TARGET_NODE}" ]]; then
+        warn "pinned node '${TARGET_NODE}' differs from the prom pod's node '${POD_NODE}' - the extraction targets the POD; node metadata below describes the pin"
+    fi
+else
+    TARGET_NODE=$(jq -r '.spec.nodeName // ""' "${METADATA_DIR}/${PROM_POD}.json" 2>/dev/null)
+    log "Pre-flight: target node AUTO-DISCOVERED from the Running pod: '${TARGET_NODE}'"
+fi
+[[ -n "${TARGET_NODE}" ]] \
+    || fail "cannot resolve the node hosting pod '${PROM_POD}' (empty spec.nodeName - pod unscheduled?) - pin it explicitly with --node <name> / SNO_NODE=<name>"
+
+# node existence + readiness + role inventory on the DYNAMICALLY resolved
+# node: same strict/salvage policy as before, minus the node-name assumption.
+NODE_JSON=$(oc get node "${TARGET_NODE}" -o json 2>&1) \
+    || fail "node '${TARGET_NODE}' not found: ${NODE_JSON} (pin a different one with --node <name> / SNO_NODE=<name>)"
+{
+    echo "$NODE_JSON"
+} > "${METADATA_DIR}/node-${TARGET_NODE}.json"
+NODE_PHASE=$(echo "$NODE_JSON" | jq -r '[.status.conditions[]? | select(.type=="Ready")][0].status // "Unknown"')
+if [[ "${NODE_PHASE}" != "True" ]]; then
+    if [[ "${STRICT_NOTREADY}" == "true" ]]; then
+        fail "node '${TARGET_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown}) - strict pre-flight. Drop --strict-notready to attempt a salvage extraction while the node is degraded."
+    else
+        warn "node '${TARGET_NODE}' is not Ready (Ready=${NODE_PHASE:-unknown}) - salvage mode (default), continuing. If oc exec to the prom pod stalls, the node's kubelet/cri is down and no data can ship."
+    fi
+fi
+echo "$NODE_JSON" | jq -c '.metadata.labels // {}' > "${METADATA_DIR}/node-${TARGET_NODE}-labels.json"
+NODE_ROLES=$(jq -r 'keys[] | select(startswith("node-role.kubernetes.io/")) | ltrimstr("node-role.kubernetes.io/")' \
+    "${METADATA_DIR}/node-${TARGET_NODE}-labels.json" 2>/dev/null | sort | paste -sd, -)
+if [[ -z "${NODE_ROLES}" ]]; then
+    warn "node '${TARGET_NODE}' carries no node-role labels at all (roles unknown to forensics)"
+elif ! echo "${NODE_ROLES}" | grep -qE '(^|,)(master|control-plane)(,|$)'; then
+    # CONTEXT-AWARE: on MNO this is normal whenever the monitoring stack is
+    # placed on infra/worker nodes. The extraction depends on the POD, not on
+    # the role label - record it for forensics, do not gate on it.
+    warn "node '${TARGET_NODE}' has no master/control-plane role (roles: ${NODE_ROLES}) - the monitoring stack runs off the control plane (MNO infra/worker placement is a common cause); harmless for the extraction, recorded for forensics"
+else
+    log "Target node: ${TARGET_NODE} (Ready=${NODE_PHASE}, roles: ${NODE_ROLES})"
+fi
 
 # 0d. Prometheus HTTP API reachability + web-port detection. OCP managed
 #     prometheus listens on 127.0.0.1:9090 behind a kube-rbac-proxy on :9091;

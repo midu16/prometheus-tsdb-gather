@@ -76,6 +76,12 @@ for v in 1 5 100; do
 done
 run_gather --at 'not a date';           assert_flag_rejected "--at 'not a date'" "cannot parse --at"
 run_gather --at '2 days ago';           assert_flag_accepted "--at '2 days ago'"
+section "test-02: --node (v1.7.0 target-node pin)"
+run_gather --node;                       assert_flag_rejected "--node without value" "needs a value"
+run_gather --node "";                    assert_flag_accepted "--node '' (= auto-discover)"
+run_gather --node master-0;              assert_flag_accepted "--node master-0 (pin)"
+run_gather --node worker-2.somedomain;   assert_flag_accepted "--node worker-2.somedomain (FQDN node pin)"
+SNO_NODE=master-1 run_gather;            assert_flag_accepted "SNO_NODE=master-1 (env pin form)"
 run_gather --strict-notready true;      assert_flag_rejected "--strict-notready with extra 'true' (not a value flag)" "unknown flag"
 STRICT_NOTREADY=maybe run_gather;       assert_flag_rejected "STRICT_NOTREADY=maybe" "must be 'true' if set"
 run_gather --strict-notready;           assert_flag_accepted "--strict-notready"

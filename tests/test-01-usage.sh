@@ -21,7 +21,7 @@ if [[ ${rc} -eq 0 ]]; then pass "--help exits 0"; else fail "--help exited ${rc}
 
 # every flag surface is documented
 for f in --max-size --size-policy --limit --since --until --include-wal \
-         --compress --max-gb --at --strict-notready "-h, --help"; do
+         --compress --node --max-gb --at --strict-notready "-h, --help"; do
     [[ "${help_out}" == *"${f}"* ]] \
         && pass "usage documents '${f}'" \
         || fail "usage missing '${f}'"

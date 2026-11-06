@@ -115,10 +115,20 @@ The gather script itself (v6, what actually runs on this cluster):
 
 - **auth**: resolves `/etc/must-gather-kubeconfig/kubeconfig`, validates,
   `export KUBECONFIG=…` for all calls (env override `MUST_GATHER_KUBECONFIG`)
-- **pre-flight**: `oc whoami` (payload carries an **oc 4.15** client — no
-  `--timeout` flag, verified), node `master-0` Ready + roles,
-  `prometheus-k8s-0` Running/Ready (180s retry for restarts), web-port probe
-  (9090/9091 from inside the pod), TSDB dir inventory
+- **pre-flight** (dynamic since v1.7.0 — no hardcoded node names): `oc whoami`
+  (payload carries an **oc 4.15** client — no `--timeout` flag, verified);
+  cluster node inventory (`cluster-nodes.json` + computed
+  `cluster-topology.json`: per-node roles + Ready, `cluster_kind`
+  single-node / multi-node compact / multi-node); the target node resolves
+  DYNAMICALLY from the Running prom pod's `spec.nodeName` (pod located by the
+  `prometheus=k8s` selector — default name stays first-choice, renamed/migrated
+  ordinals auto-detect) — valid on SNO *and* MNO, wherever the monitoring
+  stack actually landed. Pin with `--node <name>` / `SNO_NODE=<name>` (pin vs
+  pod placement mismatch = loud WARN, not an abort). Node/Ready/roles checks
+  are context-aware (no master/control-plane role is normal when monitoring
+  runs on infra/worker nodes; degraded control plane = loud WARN, the
+  extraction reads the prom pod), pod Running/Ready (180s retry for
+  restarts), web-port probe (9090/9091 from inside the pod), TSDB dir inventory
 - **snapshot probe**: `POST /api/v1/admin/tsdb/snapshot`. On this cluster
   Prometheus **3.13.2** answers `500 "admin APIs disabled"` (the OCP operator
   does not enable `prometheus-admin-api`) → the script automatically falls
@@ -171,6 +181,16 @@ The gather script itself (v6, what actually runs on this cluster):
     `retention.txt`, `block-inventory.tsv`; compressed runs also ship
     `prometheus-snapshot/<TS>.tar.zstd` + `SHA256SUMS` (unpack:
     `tar -I zstd -xf <TS>.tar.zstd -C <dir>`)
+- **dynamic node discovery** (v1.7.0): the old `SNO_NODE="master-0"` default
+  is gone — nothing is hardcoded. Pre-flight 0b inventories ALL cluster
+  nodes (roles + Ready → `cluster-topology.json`), 0c finds the Running prom
+  pod by the stack's reliable selector `prometheus=k8s`, 0c2 resolves the
+  target node from that pod (`spec.nodeName`) and validates it: not-found /
+  NotReady follow the strict/salvage policy of `--strict-notready`, role
+  labels are recorded context-aware (monitoring placed off the control plane
+  is a normal MNO layout, not an error). Optional pin: `--node <name>` /
+  `SNO_NODE=<name>`; an explicit `PROM_POD` pin is authoritative (never
+  silently falls back — also what keeps offline test runs aborting fast).
 - **metadata**: node/pod JSON, `pod describe`, log tail, rendered config (tokens
   redacted), in-cluster `promtool tsdb list` + `analyze` of the newest block
   (promtool 3.x has **no** `tsdb verify`), structural check of the local copy
@@ -186,7 +206,8 @@ MG=$(ls -dt must-gather.local.* | head -1)                    # newest run
 P="$MG"/quay-io-*-prometheus-tsdb-gather-*                    # payload dir
 
 ls "$P"
-#   version            # "prometheus-tsdb-must-gather" / "1.1.0"
+#   version            # "prometheus-tsdb-must-gather" / "1.7.0"
+#                        + cluster-topology.json: node inventory (SNO/MNO)
 #   gather.log         # full in-cluster script log
 #   whoami.txt
 #   prometheus-snapshot/<UTC-TS>/   # the TSDB: <ULID> block dirs + wal + chunks_head
@@ -223,12 +244,17 @@ du -sh "$P/prometheus-snapshot"
 
 ## Notes & caveats
 
-- **SNO single point of failure**: the Prometheus PVC is local disk on
-  `master-0`. The `MODE=direct` fallback is exactly what makes this toolkit
-  robust here — it reads the crash-consistent TSDB in place and needs the
-  running prom process only as a file server (`oc cp`), so it works even in a
-  degraded instance. If the node were NotReady the pre-flight would fail; for
-  a salvage run point `PROM_POD=<actual-name>` and relax checks 0b/0c.
+- **SNO single point of failure / MNO placement**: on SNO the Prometheus PVC
+  is local disk on the one node (in the original install `master-0`); on MNO
+  it is the disk of whichever node hosts the prom pod (auto-discovered from
+  pod → node, or pinned via `SNO_NODE`/`--node`). The `MODE=direct` fallback
+  is exactly what makes this toolkit robust here — it reads the
+  crash-consistent TSDB in place and needs the running prom process only as a
+  file server (`oc cp`), so it works even on a degraded node. If the node is
+  NotReady the pre-flight aborts only under `--strict-notready`; default
+  salvage mode attempts the extraction anyway. Pin a specific pod with
+  `PROM_POD=<name>` (explicit pins are authoritative and never silently fall
+  back).
 - **WAL loss bound (direct mode)**: worst case you lose the torn tail of the
   newest in-flight WAL segment (a few minutes). Everything already compacted
   into a block is lossless. For a zero-loss guarantee enable the admin API
