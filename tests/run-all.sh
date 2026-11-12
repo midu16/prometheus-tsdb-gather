@@ -34,7 +34,7 @@ run_suite() {
 
 if [[ ${MODE} == unit || ${MODE} == all ]]; then
     for t in test-01-usage.sh test-02-flag-parsing.sh test-03-human-size.sh \
-             test-04-timestamps.sh test-05-limit-monitor.sh; do
+             test-04-timestamps.sh test-05-limit-monitor.sh test-07-budget-trim.sh; do
         run_suite "${t}"
     done
 fi

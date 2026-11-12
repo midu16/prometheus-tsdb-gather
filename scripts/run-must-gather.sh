@@ -88,11 +88,14 @@ NS_GRACE_SECONDS="${NS_GRACE_SECONDS:-120}"   # keep NS after run: sidecar may s
 #   v1.3.0 (features/safeguard-size-selective-export.md):
 #     SINCE / UNTIL          time window ('6h', '2d', RFC3339, 'now')
 #     MAX_GATHER_BYTES       budget: 512Mi / 2Gi / none  (default 2Gi)
-#     SIZE_POLICY            fail (default) | warn
+#     SIZE_POLICY            full (default: extract everything, never trim) |
+#                            trim (newest data that fits MAX_GATHER_BYTES) |
+#                            fail | warn
 #     INCLUDE_WAL            true | false | auto (default auto)
 #     COMPRESS               none | zstd (default) | gzip
 #   v1.6.0:
-#     GATHER_LIMIT           dynamic cap DURING the copy: 4GB (default) /
+#     GATHER_LIMIT           dynamic cap DURING the copy: 4GB (default; off
+#                            under SIZE_POLICY=full unless set) /
 #                            500MB / 0 (unlimited)
 #     v1.7.0 node selection: SNO_NODE is an OPTIONAL pin of the target node;
 #                            EMPTY (default) = auto-discover the node hosting
