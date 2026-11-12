@@ -53,9 +53,20 @@
 #   --max-size <bytes|1Gi|512Mi|...>   or   MAX_GATHER_BYTES=<bytes>
 #       projected export (sum of SELECTED blocks + WAL if included) is
 #       compared against the budget; default 2 GiB, "none" = disabled.
-#   --size-policy fail|warn            or   SIZE_POLICY
-#       fail (default): FATAL + actionable error message before the copy.
-#       warn: log loudly, continue.
+#   --size-policy full|trim|fail|warn  or   SIZE_POLICY
+#       The OPERATOR chooses whether data may be dropped (v1.8.0):
+#       full (default): extract EVERYTHING selected (the whole TSDB when no
+#             --since/--until is given). The budget is informational only,
+#             nothing is trimmed, and the dynamic --limit cap is OFF unless
+#             --limit/GATHER_LIMIT is set explicitly. A pre-flight free-space
+#             check on the gather volume WARNs when the export will not fit.
+#       trim: keep the NEWEST contiguous data that fits --max-size - WAL/head
+#             first (when included), then compacted blocks newest->oldest by
+#             maxTime; older blocks stay in the pod. Logged as WARN, recorded
+#             in size-budget.txt (decision=trim, trimmed_blocks=).
+#       fail: FATAL + actionable error message before the copy.
+#       warn: log loudly, continue (copies everything selected; the default
+#             4GB --limit still applies).
 #   On a budget miss the script prints a stable, machine-grepable block
 #   (FATAL: projected must-gather TSDB export exceeds size budget ...) and
 #   writes prometheus-metadata/size-budget.txt, then exits non-zero
@@ -63,7 +74,9 @@
 #
 # Dynamic size cap (v1.6.0) -- DURING the extraction (complements the
 # pre-flight budget above, which decides BEFORE any byte leaves the pod):
-#   --limit <size>   or   GATHER_LIMIT    (default: 4GB; 0 = unlimited)
+#   --limit <size>   or   GATHER_LIMIT    (default: 4GB, but 0 = unlimited
+#                                          under --size-policy full unless set
+#                                          explicitly; 0 = unlimited)
 #       While the TSDB is copied OUT of the pod, the destination dir size
 #       is monitored CONTINUOUSLY (polled every GATHER_LIMIT_POLL second,
 #       default 1) plus a pre-transfer check per member. Once the exported
@@ -159,11 +172,12 @@ set -uo pipefail
 #   Size safeguard:
 #     --max-size <size>    bytes, or N{K,M,G,T}{i,B} (default: 2Gi; none=off)
 #                          (env: MAX_GATHER_BYTES)
-#     --size-policy fail|warn   (env: SIZE_POLICY, default fail)
+#     --size-policy full|trim|fail|warn   (env: SIZE_POLICY, default full)
 #   Dynamic size cap (continuous, DURING the extraction):
 #     --limit <size>    cap the exported TSDB while it is copied: bytes or
 #                       N{K,M,G,T}{i,B}; 0 = unlimited (env: GATHER_LIMIT;
-#                       default 4GB). On breach the extraction halts and the
+#                       default 4GB; unlimited under --size-policy full
+#                       unless set explicitly). On breach the extraction halts and the
 #                       script exits cleanly (0): what already landed is
 #                       kept + shipped, the partial in-flight member is
 #                       dropped, see prometheus-metadata/limit-halt.txt
@@ -194,13 +208,18 @@ gather [options]
 Size safeguard (pre-flight, before any copy):
   --max-size <size>    projected-export budget: bytes, or N{K,M,G,T}{i,B}
                        (default 2Gi; 'none' disables)   (env: MAX_GATHER_BYTES)
-  --size-policy fail|warn
-                       fail = abort with FATAL before the copy (default)
+  --size-policy full|trim|fail|warn
+                       full = extract EVERYTHING selected, never trim; the
+                              --limit cap is off unless set explicitly (default)
+                       trim = keep the newest data that fits --max-size,
+                              older blocks stay in the pod
+                       fail = abort with FATAL before the copy
                        warn = log loudly and continue    (env: SIZE_POLICY)
 Dynamic size cap (DURING the extraction; the destination dir is monitored
 continuously while the TSDB is being copied out):
    --limit <size>       cap the exported TSDB: bytes, or N[K|M|G|T][iB]
-                        [default: 4GB, 0: unlimited]  (env: GATHER_LIMIT)
+                        [default: 4GB (unlimited with --size-policy full), 0: unlimited]
+                        (env: GATHER_LIMIT)
                         when the in-flight export reaches the cap the
                         extraction is HALTED and the script exits cleanly
                         (exit 0 - no container crash): already-exported
@@ -245,8 +264,12 @@ EOF
 }
 
 MAX_SIZE="${MAX_GATHER_BYTES:-2Gi}"
-SIZE_POLICY="${SIZE_POLICY:-fail}"
-LIMIT="${GATHER_LIMIT:-4GB}"
+SIZE_POLICY="${SIZE_POLICY:-full}"
+# --limit default depends on the policy (resolved after flag parsing):
+# remember whether the operator set it explicitly (env or flag)
+LIMIT="${GATHER_LIMIT:-}"
+LIMIT_EXPLICIT=0
+[[ -n "${GATHER_LIMIT:-}" ]] && LIMIT_EXPLICIT=1
 GATHER_LIMIT_POLL="${GATHER_LIMIT_POLL:-1}"
 SINCE="${SINCE:-}"
 UNTIL="${UNTIL:-now}"
@@ -266,7 +289,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --max-size)     [[ $# -ge 2 ]] || { echo "gather: --max-size needs a value" >&2; exit 64; }; MAX_SIZE="$2"; shift 2 ;;
         --size-policy)  [[ $# -ge 2 ]] || { echo "gather: --size-policy needs a value" >&2; exit 64; }; SIZE_POLICY="$2"; shift 2 ;;
-        --limit)        [[ $# -ge 2 ]] || { echo "gather: --limit needs a value" >&2; exit 64; }; LIMIT="$2"; shift 2 ;;
+        --limit)        [[ $# -ge 2 ]] || { echo "gather: --limit needs a value" >&2; exit 64; }; LIMIT="$2"; LIMIT_EXPLICIT=1; shift 2 ;;
         --since)        [[ $# -ge 2 ]] || { echo "gather: --since needs a value" >&2; exit 64; }; SINCE="$2"; shift 2 ;;
         --until)        [[ $# -ge 2 ]] || { echo "gather: --until needs a value" >&2; exit 64; }; UNTIL="$2"; shift 2 ;;
         --include-wal)  [[ $# -ge 2 ]] || { echo "gather: --include-wal needs a value" >&2; exit 64; }; INCLUDE_WAL="$2"; shift 2 ;;
@@ -315,6 +338,17 @@ elif [[ -z "${MAX_BYTES}" ]]; then
     exit 64
 fi
 
+case "${SIZE_POLICY}" in
+    full|trim|fail|warn) : ;;
+    *) echo "gather: --size-policy must be 'full', 'trim', 'fail' or 'warn', got: ${SIZE_POLICY}" >&2; exit 64 ;;
+esac
+# policy-dependent --limit default: 'full' means extract everything, so the
+# 4GB in-flight cap (which would silently cut the export) is off unless the
+# operator asked for it
+if (( ! LIMIT_EXPLICIT )); then
+    [[ "${SIZE_POLICY}" == "full" ]] && LIMIT="0" || LIMIT="4GB"
+fi
+
 LIMIT_BYTES="$(human_size_to_bytes "${LIMIT}")"
 if [[ "${LIMIT_BYTES}" == "none" ]]; then
     LIMIT_BYTES=""                  # unlimited (explicit --limit none/off/unlimited)
@@ -330,10 +364,6 @@ fi
 [[ "${GATHER_LIMIT_POLL}" =~ ^(0[.][1-9][0-9]*|[1-9][0-9]*([.][0-9]+)?)$ ]] \
     || { echo "gather: GATHER_LIMIT_POLL must be a positive number of seconds, got: ${GATHER_LIMIT_POLL}" >&2; exit 64; }
 
-case "${SIZE_POLICY}" in
-    fail|warn) : ;;
-    *) echo "gather: --size-policy must be 'fail' or 'warn', got: ${SIZE_POLICY}" >&2; exit 64 ;;
-esac
 case "${COMPRESS}" in
     none|zstd|gzip) : ;;
     *) echo "gather: --compress must be none|zstd|gzip, got: ${COMPRESS}" >&2; exit 64 ;;
@@ -493,7 +523,7 @@ mkdir -p "${OUT_DIR}" "${TSDB_OUT_DIR}" "${METADATA_DIR}"
 # ---------------------------------------------------------------------------
 {
     echo "prometheus-tsdb-must-gather"
-    echo "1.7.0"
+    echo "1.8.0"
 } > "${OUT_DIR}/version"
 
 # ---------------------------------------------------------------------------
@@ -771,27 +801,95 @@ retention_detect() {
 #   [windowless runs project the full TSDB - same number as the inventory]
 # Writes prometheus-metadata/size-budget.txt; honors SIZE_POLICY.
 # INVOCATION: size_budget_gate "<inventory lines>"
+#
+# SIZE_POLICY=trim (default, v1.8.0) on a budget miss: newest-first fit.
+#   1. the head (wal + chunks_head) is kept when WAL_INCLUDED=1 and it fits
+#      on its own; if the head ALONE exceeds the budget it is dropped
+#      (WAL_INCLUDED=0) and only compacted blocks are considered
+#   2. selected blocks are walked newest -> oldest by maxTime (NOT by ULID:
+#      freshly cut 2h blocks can carry an older ULID than the last
+#      compaction output) and kept while they fit; the walk STOPS at the
+#      first block that does not fit, so the export stays one contiguous
+#      time range (no holes from skipping a large block for smaller older
+#      ones)
+#   3. if nothing at all fits -> same FATAL as policy=fail
+#   Trimmed blocks move to EXCLUDED_BLOCKS (never leave the pod) and
+#   EFF_SINCE_S is raised to the oldest kept block, so time-window.json
+#   reports the window actually exported.
 # ---------------------------------------------------------------------------
+BUDGET_TRIMMED=0
+TRIMMED_BLOCKS=""
 size_budget_gate() {
     local inv="$1"
-    local projected=0 n mt xt sz add
+    local projected=0 n mt xt sz head_bytes=0
     while IFS=$'\t' read -r n mt xt sz; do
         [[ -n "${n}" ]] || continue
         case " ${SELECTED_BLOCKS} " in *" ${n} "*) projected=$(( projected + sz )) ;; esac
     done <<< "${inv}"
     if (( WAL_INCLUDED )); then
-        add=$(( $(remote_dir_bytes "wal") + $(remote_dir_bytes "chunks_head") ))
-        projected=$(( projected + add ))
+        head_bytes=$(( $(remote_dir_bytes "wal") + $(remote_dir_bytes "chunks_head") ))
+        projected=$(( projected + head_bytes ))
     fi
+    local projected_untrimmed=${projected}
     local budget_display="${MAX_SIZE}"
     [[ -n "${MAX_BYTES}" ]] && budget_display="${MAX_SIZE} (${MAX_BYTES} bytes)"
     local decision="disabled"
-    if [[ -n "${MAX_BYTES}" ]]; then
+    if [[ "${SIZE_POLICY}" == "full" ]]; then
+        decision="full"            # operator chose: extract everything
+    elif [[ -n "${MAX_BYTES}" ]]; then
         if (( projected > MAX_BYTES )); then
             decision="deny"
         else
             decision="allow"
         fi
+    fi
+    # free space on the gather volume (where the copy lands) - informational
+    # for every policy, a loud WARN when the export will not fit
+    local vol_avail
+    vol_avail=$(df -PB1 "${OUT_DIR:-/must-gather}" 2>/dev/null | awk 'NR==2{print $4}')
+    [[ "${vol_avail}" =~ ^[0-9]+$ ]] || vol_avail=""
+    if [[ "${decision}" == "deny" && "${SIZE_POLICY}" == "trim" ]]; then
+        local left=${MAX_BYTES} kept="" kept_n=0 kept_bytes=0 oldest_kept=""
+        local head_dropped=0
+        if (( WAL_INCLUDED )); then
+            if (( head_bytes <= left )); then
+                left=$(( left - head_bytes ))
+            else
+                WAL_INCLUDED=0; head_dropped=1; head_bytes=0
+            fi
+        fi
+        local stop=0
+        while IFS=$'\t' read -r n mt xt sz; do
+            [[ -n "${n}" ]] || continue
+            case " ${SELECTED_BLOCKS} " in *" ${n} "*) ;; *) continue ;; esac
+            if (( ! stop )) && (( sz <= left )); then
+                kept+="${n} "; kept_n=$(( kept_n + 1 ))
+                kept_bytes=$(( kept_bytes + sz )); left=$(( left - sz ))
+                oldest_kept=${mt}
+            else
+                stop=1
+                TRIMMED_BLOCKS+="${n} "
+            fi
+        done < <(sort -t$'\t' -k3,3nr -k2,2nr <<< "${inv}")
+        if (( kept_n > 0 || WAL_INCLUDED )); then
+            decision="trim"
+            BUDGET_TRIMMED=1
+            # preserve the original (chronological) inventory order
+            local new_sel=""
+            for n in ${SELECTED_BLOCKS}; do
+                case " ${kept} " in *" ${n} "*) new_sel+="${n} " ;; esac
+            done
+            SELECTED_BLOCKS="${new_sel}"
+            EXCLUDED_BLOCKS+="${TRIMMED_BLOCKS}"
+            [[ -n "${oldest_kept}" ]] && (( oldest_kept > EFF_SINCE_S )) && EFF_SINCE_S=${oldest_kept}
+            projected=$(( kept_bytes + head_bytes ))
+            log "WARN: projected TSDB export $(awk -v b=${projected_untrimmed} 'BEGIN{printf "%.1f MiB", b/1048576}') exceeds budget ${budget_display} - policy=trim: keeping the NEWEST data that fits"
+            log "  kept ${kept_n} block(s)$( (( WAL_INCLUDED )) && echo ' + wal/chunks_head' ) = $(awk -v b=${projected} 'BEGIN{printf "%.1f MiB", b/1048576}'); trimmed $(tr ' ' '\n' <<<"${TRIMMED_BLOCKS}" | grep -c .) older block(s) (stay in the pod)"
+            (( head_dropped )) && log "  head (wal+chunks_head) alone exceeds the budget - dropped from the export"
+            [[ -n "${oldest_kept}" ]] && log "  effective window now [$(date -u -d "@${EFF_SINCE_S}" +%Y-%m-%dT%H:%M:%SZ) .. $(date -u -d "@${EFF_UNTIL_S}" +%Y-%m-%dT%H:%M:%SZ)]"
+            log "  hint: for older history pass --since/--until, or raise --max-size (MAX_GATHER_BYTES); --size-policy fail restores the hard abort"
+        fi
+        # nothing fits at all: fall through to the policy=fail FATAL below
     fi
     {
         echo "budget=${MAX_SIZE:-(unset)}"
@@ -801,14 +899,21 @@ size_budget_gate() {
         echo "blocks_selected=$(tr ' ' '\n' <<<"${SELECTED_BLOCKS:-(full)}" | grep -c .)/$(tr ' ' '\n' <<<"${SELECTED_BLOCKS} ${EXCLUDED_BLOCKS}" | grep -c .)"
         echo "wal_included=${WAL_INCLUDED}"
         echo "projected_bytes=${projected}"
+        [[ "${decision}" == "trim" ]] && echo "projected_untrimmed_bytes=${projected_untrimmed}"
+        [[ "${decision}" == "trim" ]] && echo "trimmed_blocks=${TRIMMED_BLOCKS% }"
         echo "projected_human=$(awk -v b=${projected} 'BEGIN{printf "%.1f MiB", b/1048576}')"
         echo "budget_bytes=${MAX_BYTES:-(disabled)}"
+        echo "gather_volume_avail_bytes=${vol_avail:-(unknown)}"
         echo "compress=${COMPRESS}"
         echo "decision=${decision}"
+        [[ "${decision}" == "full" ]] && echo "note=policy=full: everything selected is exported, the budget is informational only"
+        [[ "${decision}" == "trim" ]] && echo "note=policy=trim: newest contiguous data that fits the budget is exported; trimmed_blocks never left the pod"
         [[ "${decision}" == "allow" ]] && echo "note=projection computed from remote block inventory (pre-copy); compression applied AFTER extraction does not change what the gather pod has to hold"
     } > "${METADATA_DIR}/size-budget.txt"
     case "${decision}" in
         deny)
+            # policy=trim lands here only when NOT EVEN ONE block (nor the
+            # head) fits the budget -> same hard contract as policy=fail
             if [[ "${SIZE_POLICY}" == "warn" ]]; then
                 log "WARN: projected must-gather TSDB export exceeds size budget (policy=warn, continuing)"
                 log "  projected=$(( projected / 1024 / 1024 ))MiB  budget=$(awk -v b=${MAX_BYTES} 'BEGIN{printf "%.1f MiB", b/1048576}')  policy=warn"
@@ -823,6 +928,12 @@ size_budget_gate() {
                 exit 1
             fi
             ;;
+        full)
+            log "Budget: policy=full - extracting EVERYTHING selected: projected $(awk -v b=${projected} 'BEGIN{printf "%.1f MiB", b/1048576}') (budget ${budget_display} not enforced; --limit $( (( LIMIT_ACTIVE )) && echo "${LIMIT}" || echo unlimited))"
+            ;;
+        trim)
+            : # already logged above
+            ;;
         allow)
             log "Budget: projected $(awk -v b=${projected} 'BEGIN{printf "%.1f MiB", b/1048576}') <= budget ${budget_display} (policy=${SIZE_POLICY}) - allowed"
             ;;
@@ -830,6 +941,11 @@ size_budget_gate() {
             log "Budget: disabled (MAX_GATHER_BYTES=none) - no size gate this run"
             ;;
     esac
+    if [[ -n "${vol_avail}" ]] && (( projected > vol_avail )); then
+        log "WARN: projected export $(awk -v b=${projected} 'BEGIN{printf "%.1f MiB", b/1048576}') is LARGER than the free space on the gather volume $(awk -v b=${vol_avail} 'BEGIN{printf "%.1f MiB", b/1048576}') (${OUT_DIR:-/must-gather})"
+        log "  the framework's disk-usage checker (--volume-percentage) will likely kill the gather mid-copy;"
+        log "  options: --since/--until, --size-policy trim --max-size <fits>, or a node with more ephemeral storage"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1620,6 +1736,7 @@ oc get -n "${MON_NS}" pod "${PROM_POD}" -o jsonpath='{range .spec.containers[?(@
     echo "at_timestamp=${AT_TS:-(none)}"
     echo "max_size=${MAX_SIZE}"
     echo "size_policy=${SIZE_POLICY}"
+    echo "budget_trimmed=${BUDGET_TRIMMED}"
     echo "limit=${LIMIT}"
     echo "limit_active=$(( LIMIT_ACTIVE ))"
     echo "limit_bytes=${LIMIT_BYTES:-(unlimited)}"
@@ -1652,7 +1769,7 @@ TW_UNTIL=$(date -u -d "@${EFF_UNTIL_S}" +%Y-%m-%dT%H:%M:%SZ)
         --argjson clamped "$([[ ${WIN_CLAMPED} -eq 1 ]] && echo true || echo false)" \
         --arg orig_since "${WIN_ORIG_SINCE}" \
         --arg orig_until "${WIN_ORIG_UNTIL}" \
-        --arg note "$( [[ "${WIN_CLAMPED}" -eq 1 ]] && echo 'Requested window did not intersect any TSDB block (retention); clamped to the available data' || { [[ "${WINDOW_ACTIVE}" -eq 1 && -n "${EXCLUDED_BLOCKS}" ]] && echo 'Excluded blocks outside window to reduce gather size' || echo 'Full export: no time window requested'; } )" \
+        --arg note "$( [[ "${WIN_CLAMPED}" -eq 1 ]] && echo 'Requested window did not intersect any TSDB block (retention); clamped to the available data' || { [[ "${BUDGET_TRIMMED}" -eq 1 ]] && echo 'Size budget exceeded (policy=trim): oldest blocks trimmed, newest data that fits the budget exported'; } || { [[ "${WINDOW_ACTIVE}" -eq 1 && -n "${EXCLUDED_BLOCKS}" ]] && echo 'Excluded blocks outside window to reduce gather size' || echo 'Full export: no time window requested'; } )" \
         --argjson included "$( jq -Rn '[inputs | select(length>0)]' <<<"$(tr ' ' '\n' <<<"${SELECTED_BLOCKS}" | grep . || true)" )" \
         --argjson excluded "$( jq -Rn '[inputs | select(length>0)]' <<<"$(tr ' ' '\n' <<<"${EXCLUDED_BLOCKS}" | grep . || true)" )" \
         '{

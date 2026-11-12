@@ -162,10 +162,22 @@ The gather script itself (v6, what actually runs on this cluster):
   `features/safeguard-size-selective-export.md`): pre-flight gate *before* any
   byte leaves the pod — block inventory → time-window selection → retention
   detect → size budget. Flags/env (all forwarded by the wrapper):
-  - `MAX_GATHER_BYTES` / `--max-size` — projected-export budget, `512Mi`/`2Gi`
-    (default) / `none` = off. `SIZE_POLICY=fail` (default) aborts pre-copy with
-    a stable `FATAL: projected must-gather TSDB export exceeds size budget`
-    block; `warn` continues
+  - `SIZE_POLICY` / `--size-policy` — **you choose** whether data may be dropped (v1.8.0):
+    - `full` (default) — extract **everything** selected (the whole TSDB when no
+      window is given). Nothing is trimmed, the budget is informational only and
+      the `--limit` cap is off unless set explicitly. A loud WARN is logged when
+      the projected export is larger than the free space on the gather volume
+    - `trim` — keep the **newest** contiguous data that fits `MAX_GATHER_BYTES`
+      (WAL/head + newest blocks by maxTime); older blocks stay in the pod,
+      recorded as `decision=trim` + `trimmed_blocks=` in `size-budget.txt`
+    - `fail` — abort pre-copy with a stable
+      `FATAL: projected must-gather TSDB export exceeds size budget` block
+      (also the outcome of `trim` when not even one block fits)
+    - `warn` — log the budget miss and continue (default 4GB `--limit` applies)
+  - `MAX_GATHER_BYTES` / `--max-size` — budget used by `trim`/`fail`/`warn`,
+    `512Mi`/`2Gi` (default) / `none` = off
+  - examples: everything → `oc adm must-gather --image=<img>`;
+    newest 8Gi → `oc adm must-gather --image=<img> -- /usr/bin/gather --size-policy trim --max-size 8Gi`
    - `SINCE` / `UNTIL` — time window (`6h`, `2d`, RFC3339, unix, `now`). Only
      blocks whose range intersects the window are copied; a window that
      intersects **no** block (retention already GC'd that period) no longer
@@ -237,7 +249,9 @@ du -sh "$P/prometheus-snapshot"
 | `podman-compose up -d` hangs | this host: old docker-compose-v1 delegation / slow pull. Pre-pull both images, use standalone `podman-compose`, `timeout 240 … up -d` |
 | host `curl 127.0.0.1:9091` times out but container is up | pasta port-forward flakiness (Bazzite). Query in-container: `podman exec fg-prometheus wget -qO- 'http://127.0.0.1:9090/…'` |
 | Grafana queries return 0 points | instant query at "now" on historical data. Use `start`/`end` inside the block window (see `prometheus-metadata/tsdb-verify.txt`) |
-| gather FATAL `projected must-gather TSDB export exceeds size budget` | v1.3.0 pre-flight budget gate (nothing copied). Narrow `SINCE`/`UNTIL`, raise `MAX_GATHER_BYTES`, or set `SIZE_POLICY=warn`. See `prometheus-metadata/size-budget.txt` |
+| gather FATAL `projected must-gather TSDB export exceeds size budget` | pre-flight budget gate (nothing copied). Since v1.8.0 only with `SIZE_POLICY=fail`, or `trim` when not even a single block fits the budget (the default `full` never aborts on size). Narrow `SINCE`/`UNTIL`, raise `MAX_GATHER_BYTES`, or use `SIZE_POLICY=full`/`trim`. See `prometheus-metadata/size-budget.txt` |
+| gather WARN `projected export ... is LARGER than the free space on the gather volume` | default `full` policy on a TSDB bigger than the must-gather pod's volume: the framework's `--volume-percentage` checker will likely kill the copy. Use `SINCE`/`UNTIL` or `SIZE_POLICY=trim MAX_GATHER_BYTES=<fits>` |
+| gather WARN `exceeds budget ... policy=trim: keeping the NEWEST data that fits` | opt-in `SIZE_POLICY=trim`: TSDB larger than `MAX_GATHER_BYTES`. Only the most recent data was shipped; `size-budget.txt` lists `trimmed_blocks`. For older history pass `SINCE`/`UNTIL` or raise `MAX_GATHER_BYTES` |
 | gather WARN `requested window [..] does not intersect ANY TSDB block on disk` | `SINCE`/`UNTIL` outside the data on disk (retention deleted it). **v1.4.0: no longer fatal** — the window is clamped to the available data and the closest snapshot is exported. Verify `prometheus-metadata/retention.txt` + `time-window.json` (`window_clamped`, `original_request`) to confirm what was really shipped |
 | gather log `zstd compression failed - keeping the unarchived tree only` | image built before the zstd install (Containerfile `dnf -y install zstd`). Rebuild + new tag, or run with `COMPRESS=gzip`/`none` |
 | `prometheus-snapshot/<TS>.tar.zstd` present but playback "no data" | the archive is for transfer only: unpack first (`tar -I zstd -xf <TS>.tar.zstd -C <dir>`) and point `SNAPSHOT_DIR` at the unpacked tree |

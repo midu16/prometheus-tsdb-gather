@@ -168,22 +168,25 @@ run_optional() {  # <case id> <name> <flags...> : honors ABORT + E2E_QUICK
 #   every case also re-proves the common contract (payload dir present, no
 #   secret leak); version is checked in case 01 (same image for all runs).
 #
-#   NOTE: cases pass --max-size none unless they are ABOUT the pre-flight
-#   budget (06/07), so the default 2Gi budget cannot shadow the flag under
-#   test. The DEFAULT 4GB --limit stays active everywhere (that is the new
-#   default) - on a cluster whose windowed export exceeds 4GB, case 01/02
-#   would halt by design (limit-halt.txt) instead of reporting DONE.
+#   NOTE (v1.8.0): the default --size-policy is 'full' (extract everything,
+#   no budget enforcement, --limit off unless set explicitly), so case 01
+#   pulls the WHOLE TSDB - size E2E_DEST/E2E_TIMEOUT for the cluster.
+#   Cases about the pre-flight budget (06/07/14) pick their policy
+#   explicitly. Cases that still pass --max-size none do so for backward
+#   compatibility only (a no-op under 'full').
 # =============================================================================
 
-section "case 01: full export, all defaults (limit defaults to 4GB)"
-run_optional 01 e2e-01-default --max-size none
+section "case 01: full export, all defaults (policy=full, limit unlimited)"
+run_optional 01 e2e-01-default
 if (( RAN )) && have_payload "${CDIR}"; then
     check_version
     check_done
     check_no_secret_leak
     check_field prometheus-metadata/extraction-mode.json "window_active=0"
-    check_field prometheus-metadata/extraction-mode.json "limit=4GB"
-    check_field prometheus-metadata/extraction-mode.json "limit_active=1"
+    check_field prometheus-metadata/extraction-mode.json "size_policy=full"
+    check_field prometheus-metadata/extraction-mode.json "limit=0"
+    check_field prometheus-metadata/extraction-mode.json "limit_active=0"
+    check_field prometheus-metadata/size-budget.txt "decision=full"
     NBLOCKS=$(find "${PDIR}/prometheus-snapshot" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | grep -cE '/[0-9A-Z]{26}$' || true)
     if [[ ${NBLOCKS:-0} -ge 1 ]]; then pass "exported ${NBLOCKS} block dir(s)"; else fail "no block dirs in the export"; fi
     check_blocks_ok
@@ -257,8 +260,8 @@ if (( RAN )) && have_payload "${CDIR}"; then
         && pass "budget warn-and-continue logged" || fail "no warn-and-continue log line"
 fi
 
-section "case 07: budget miss + default policy=fail (pre-copy FATAL, nothing ships)"
-run_optional 07 e2e-07-budget-fail --max-size 1MB --limit 0
+section "case 07: budget miss + --size-policy fail (pre-copy FATAL, nothing ships)"
+run_optional 07 e2e-07-budget-fail --max-size 1MB --size-policy fail --limit 0
 if (( RAN )) && have_payload "${CDIR}"; then
     # NOTE: the framework (oc 5.0.0-rc.2) returns rc=0 even when the payload
     # exits non-zero - it only requires its own copy phase to succeed. The
@@ -300,9 +303,8 @@ if (( RAN )) && have_payload "${CDIR}"; then
 fi
 
 section "case 11: the operator's EXACT production invocation (--limit 1234GB)"
-#   note: NO --max-size override on purpose - the default 2Gi pre-flight
-#   budget gate is part of the tested path (on a >2Gi cluster this case
-#   would refuse at the budget, which is correct behavior)
+#   note: NO --max-size / --size-policy override on purpose - the default
+#   policy (full) is part of the tested path
 run_optional 11 e2e-11-production-flags --since 30d --until 29d --limit 1234GB
 if (( RAN )) && have_payload "${CDIR}"; then
     check_done
@@ -310,7 +312,7 @@ if (( RAN )) && have_payload "${CDIR}"; then
     check_field prometheus-metadata/extraction-mode.json "limit=1234GB"
     check_field prometheus-metadata/extraction-mode.json "limit_active=1"
     check_field prometheus-metadata/extraction-mode.json "limit_bytes=1324997410816"
-    grep -q '^decision=\(allow\|deny\)$' "${PDIR}/prometheus-metadata/size-budget.txt" 2>/dev/null \
+    grep -q '^decision=\(full\|allow\|deny\)$' "${PDIR}/prometheus-metadata/size-budget.txt" 2>/dev/null \
         && pass "size-budget gate decided: $(grep '^decision=' "${PDIR}/prometheus-metadata/size-budget.txt")" \
         || fail "size-budget.txt has no decision"
     check_sums
@@ -340,6 +342,22 @@ if (( RAN )) && have_payload "${CDIR}"; then
     else
         fail "wal/ dir missing although --include-wal true"
     fi
+fi
+
+section "case 14: --size-policy trim (opt-in: newest data that fits, rest stays)"
+run_optional 14 e2e-14-budget-trim --max-size 1Gi --size-policy trim --limit 0
+if (( RAN )) && have_payload "${CDIR}"; then
+    check_done
+    check_field prometheus-metadata/extraction-mode.json "size_policy=trim"
+    if grep -q '^decision=trim$' "${PDIR}/prometheus-metadata/size-budget.txt" 2>/dev/null; then
+        pass "budget trimmed: $(grep '^trimmed_blocks=' "${PDIR}/prometheus-metadata/size-budget.txt" | wc -w) block(s) left in the pod"
+        check_field prometheus-metadata/extraction-mode.json "budget_trimmed=1"
+        grep -q 'policy=trim: keeping the NEWEST' "${PDIR}/gather.log" && pass "trim WARN logged" || fail "no trim WARN in gather.log"
+    else
+        grep -q '^decision=allow$' "${PDIR}/prometheus-metadata/size-budget.txt" 2>/dev/null \
+            && pass "TSDB fits 1Gi - nothing to trim (decision=allow)" || fail "size-budget.txt: neither trim nor allow"
+    fi
+    check_blocks_ok
 fi
 
 finish "test-06-e2e-must-gather"

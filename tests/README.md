@@ -8,10 +8,11 @@ no copies of the logic.
 
 | suite | what it runs | cluster needed |
 |---|---|---|
-| `test-01-usage.sh` | `--help`/`-h` contract incl. `--limit <size> [default: 4GB, 0: unlimited]` | no |
+| `test-01-usage.sh` | `--help`/`-h` contract incl. `--limit <size> [default: 4GB (unlimited with --size-policy full), 0: unlimited]` | no |
 | `test-02-flag-parsing.sh` | **every flag**, valid + invalid, flag and env forms (exit 64 rejections with stable messages; acceptances prove the combo survives validation). Includes the production combos `--since 30d --until 29d --limit 1234GB` and `--limit 0` | no (rejections exit before any cluster access; acceptances stop at pre-flight via a bogus pod - side-effect-free) |
 | `test-03-human-size.sh` | `human_size_to_bytes`: `0/512/1K/4KB/100Mb/500MB/4GB/1234GB/1T/2TB/1KiB/512Mi/2Gi/3Ti/none/off/unlimited/...` + invalid | no |
 | `test-04-timestamps.sh` | `parse_ts_seconds`: Prometheus letter durations (`30d`, `6h`, `90m`, `12s`, `1w`, `3d12h`), RFC3339, GNU prose (`24 hours ago`), epoch, `now`; since>until rejection | no |
+| `test-07-budget-trim.sh` | the real `size_budget_gate`: default `full` (no trim/abort, free-space WARN), opt-in `trim` (newest-first by maxTime, contiguous, head drop, nothing-fits FATAL), `fail`, and the policy-dependent `--limit` default | no |
 | `test-05-limit-monitor.sh` | the v1.6.0 `--limit` extraction block with a stubbed `oc` producing real tar streams from a fake remote: **pre-transfer halt**, **mid-transfer breach** (pipeline killed, partial member dropped, exit 0, `limit-halt.txt`), **under-cap** byte-identical copy, **fail-retry-once-then-FATAL**, **live-WAL torn-tail** classification | no |
 | `test-06-e2e-must-gather.sh` | the **production invocation** per flag case against the live cluster (below) | **yes** (self-skips + exit 0 without one; `E2E_REQUIRED=1` hard-fails) |
 
@@ -53,7 +54,7 @@ bash tests/test-02-flag-parsing.sh   # a single suite
 
 | id | flags | verifies |
 |---|---|---|
-| 01 | *(defaults)* `--max-size none` | full export; default `--limit 4GB` in play; snapshot tree, `time-window.json`, `window_active=0` |
+| 01 | *(defaults)* | full export (`size_policy=full`, `decision=full`, `limit_active=0`); snapshot tree, `time-window.json`, `window_active=0` |
 | 02 | `--since 30d --until 29d` | the production window; `window_active=1`, `retention.txt` |
 | 03 | `--limit 0` | unlimited: `limit_active=0`, no halt record |
 | 04 | `--limit 1Mi` | **guaranteed breach**: framework rc **0** (no container crash), `limit-halt.txt` with `halt_reason`, partial in-flight member dropped, remaining blocks structurally valid |
@@ -63,9 +64,10 @@ bash tests/test-02-flag-parsing.sh   # a single suite
 | 08 | `--include-wal false` | no `wal/` dir in the export |
 | 09 | `--strict-notready` | strict gate recorded, healthy cluster still runs |
 | 10 | `--max-gb 100 --at "2 days ago"` | legacy post-copy guards recorded (`export-guards.txt`) |
-| 11 | `--since 30d --until 29d --limit 1234GB` | the operator's EXACT production invocation (incl. default 2Gi budget gate + recorded `limit_bytes`) |
+| 11 | `--since 30d --until 29d --limit 1234GB` | the operator's EXACT production invocation (incl. default `full` policy + recorded `limit_bytes`) |
 | 12 | `--compress gzip` | `.tar.gz` archive shipped; `sha256sum -c SHA256SUMS` passes |
 | 13 | `--include-wal true` | `wal/` dir ships, `include_wal=true` recorded |
+| 14 | `--size-policy trim --max-size 1Gi` | opt-in trim: `decision=trim` + `trimmed_blocks`, `budget_trimmed=1`, kept blocks valid (or `decision=allow` when the TSDB fits) |
 
 Every case additionally asserts: payload dir present, `version` =
 `prometheus-tsdb-must-gather/1.6.0`, and **no kubeconfig/credential leak**

@@ -15,9 +15,9 @@ if [[ ${rc} -eq 0 ]]; then pass "--help exits 0"; else fail "--help exited ${rc}
     && pass "usage mentions '--limit <size>'" \
     || fail "usage missing '--limit <size>'"
 
-[[ "${help_out}" == *"[default: 4GB, 0: unlimited]"* ]] \
-    && pass "usage carries '[default: 4GB, 0: unlimited]'" \
-    || fail "usage missing '[default: 4GB, 0: unlimited]'"
+[[ "${help_out}" == *"[default: 4GB (unlimited with --size-policy full), 0: unlimited]"* ]] \
+    && pass "usage carries '[default: 4GB (unlimited with --size-policy full), 0: unlimited]'" \
+    || fail "usage missing '[default: 4GB (unlimited with --size-policy full), 0: unlimited]'"
 
 # every flag surface is documented
 for f in --max-size --size-policy --limit --since --until --include-wal \

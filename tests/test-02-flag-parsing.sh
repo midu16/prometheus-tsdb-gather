@@ -37,8 +37,8 @@ run_gather --max-size junk;             assert_flag_rejected "--max-size junk" "
 for v in 2Gi 512Mi 500MB 1073741824 none off; do
     run_gather --max-size "${v}";       assert_flag_accepted "--max-size ${v}"
 done
-run_gather --size-policy bogus;         assert_flag_rejected "--size-policy bogus" "must be 'fail' or 'warn'"
-for v in fail warn; do
+run_gather --size-policy bogus;         assert_flag_rejected "--size-policy bogus" "must be 'full', 'trim', 'fail' or 'warn'"
+for v in full trim fail warn; do
     run_gather --size-policy "${v}";    assert_flag_accepted "--size-policy ${v}"
 done
 
